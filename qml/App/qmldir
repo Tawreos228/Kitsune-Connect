@@ -1,0 +1,16 @@
+module App
+singleton Theme 1.0 Theme.qml
+Main 1.0 Main.qml
+ConnectButton 1.0 ConnectButton.qml
+ServerCard 1.0 ServerCard.qml
+Toast 1.0 Toast.qml
+Waveform 1.0 Waveform.qml
+ModeSwitch 1.0 ModeSwitch.qml
+IconButton 1.0 IconButton.qml
+Toggle 1.0 Toggle.qml
+ThemeToggle 1.0 ThemeToggle.qml
+SettingRow 1.0 SettingRow.qml
+Segmented 1.0 Segmented.qml
+ValueField 1.0 ValueField.qml
+ChipRow 1.0 ChipRow.qml
+HotkeyField 1.0 HotkeyField.qml

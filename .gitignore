@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+# временные кадры/скриншоты разработки
+shot_*.png
+_*.py
+*.spec
+build/
+dist/
