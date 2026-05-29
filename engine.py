@@ -14,8 +14,17 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-CORE = Path(__file__).resolve().parent / "core" / "sing-box.exe"
+_CORE_DIR = Path(__file__).resolve().parent / "core"
 MIXED_PORT = 2080
+
+
+def core_cmd() -> list[str]:
+    """База команды ядра. Если есть патченый nekobox_core (больше протоколов) — берём его
+    в CLI-режиме (`sing-box` subcommand), иначе официальный sing-box."""
+    nb = _CORE_DIR / "nekobox_core.exe"
+    if nb.exists():
+        return [str(nb), "sing-box"]
+    return [str(_CORE_DIR / "sing-box.exe")]
 
 
 def _tls_block(s: dict) -> dict | None:
@@ -105,7 +114,7 @@ def check_config(cfg: dict) -> tuple[bool, str]:
     """Валидация конфига встроенной проверкой sing-box."""
     f = Path(tempfile.gettempdir()) / "kitsune_check.json"
     f.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
-    r = subprocess.run([str(CORE), "check", "-c", str(f)],
+    r = subprocess.run(core_cmd() + ["check", "-c", str(f)],
                        capture_output=True, text=True)
     return r.returncode == 0, (r.stderr or r.stdout).strip()
 
@@ -131,7 +140,7 @@ class Core:
             raise RuntimeError("Невалидный конфиг: " + msg)
         self._cfg_path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
         flags = 0x08000000 if hasattr(subprocess, "CREATE_NO_WINDOW") else 0  # CREATE_NO_WINDOW
-        self._proc = subprocess.Popen([str(CORE), "run", "-c", str(self._cfg_path)],
+        self._proc = subprocess.Popen(core_cmd() + ["run", "-c", str(self._cfg_path)],
                                       creationflags=flags)
 
     def stop(self) -> None:
