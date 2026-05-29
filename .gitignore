@@ -9,3 +9,5 @@ _*.py
 *.spec
 build/
 dist/
+# ядро sing-box не коммитим (большой бинарь) — тянется через core/fetch_core.py
+core/*.exe
