@@ -67,7 +67,7 @@ class Backend(QObject):
         super().__init__()
         self._lang = "ru"                      # i18n: язык notify-сообщений; синкается из QML T.lang
         self._status = "disconnected"          # disconnected | connecting | connected
-        self._server = "Netherlands · Amsterdam"
+        self._server = ""                      # выбранный сервер (восстановится из state.json при загрузке)
         self._ping = 0
         self._down = 0.0                       # MB за сессию (мок)
         self._up = 0.0
@@ -84,39 +84,16 @@ class Backend(QObject):
         self._hk_vk = 0x56                     # 'V'
         self._hk_suspended = False
         self._currentGroup = 0
+        # Минимальный дефолт — одна пустая группа «Мои сервера». Все подписки/сервера юзер добавляет сам;
+        # сохраняются на диск в %LocalAppData%\Kitsune\groups.json через _save_state().
         self._groups = [
-            {
-                "name": "Мои сервера", "type": "manual", "url": "",
-                "updated": "—", "auto": False, "config": None,
-                "servers": [
-                    {"code": "NL", "country": "Netherlands", "city": "Amsterdam", "ping": 38},
-                    {"code": "DE", "country": "Germany", "city": "Frankfurt", "ping": 52},
-                    {"code": "US", "country": "United States", "city": "New York", "ping": 96},
-                ],
-            },
-            {
-                "name": "FastVPN", "type": "subscription",
-                "url": "https://sub.fastvpn.io/s/ab12cd34",
-                "updated": "сегодня 14:20", "auto": True,
-                "config": {"dns": "https://dns.fastvpn.io/dns-query", "adblock": True, "final": 0},
-                "servers": [
-                    {"code": "NL", "country": "Netherlands", "city": "Amsterdam", "ping": 41},
-                    {"code": "FR", "country": "France", "city": "Paris", "ping": 47},
-                    {"code": "GB", "country": "United Kingdom", "city": "London", "ping": 61},
-                    {"code": "SE", "country": "Sweden", "city": "Stockholm", "ping": 70},
-                ],
-            },
-            {
-                "name": "Free Nodes", "type": "subscription",
-                "url": "https://freenodes.example/sub.txt",
-                "updated": "вчера", "auto": False,
-                "config": {"dns": "8.8.8.8", "adblock": False, "final": 0},
-                "servers": [
-                    {"code": "JP", "country": "Japan", "city": "Tokyo", "ping": 138},
-                    {"code": "SG", "country": "Singapore", "city": "Singapore", "ping": 152},
-                ],
-            },
+            {"name": "Мои сервера", "type": "manual", "url": "",
+             "updated": "—", "auto": False, "config": None,
+             "servers": []},
         ]
+        self._server = ""                      # выбранный сервер; будет восстановлен из state.json или останется пустым
+        # Загружаем сохранённое состояние, если есть. При успехе — затрёт пустой дефолт выше.
+        self._load_state()
 
         self._core = engine.Core()
         self._settings: dict = {}              # настройки маршрутизации/DNS/mux из UI
@@ -164,6 +141,54 @@ class Backend(QObject):
         self._tick = QTimer(self)
         self._tick.setInterval(1000)
         self._tick.timeout.connect(self._on_tick)
+
+    # ---- persistent state (groups + currentGroup + server) ----
+    _STATE_FILE = "groups.json"
+
+    def _state_path(self):
+        from pathlib import Path
+        return engine.state_dir() / self._STATE_FILE
+
+    def _load_state(self) -> bool:
+        """Загрузить сохранённые группы/выбранный сервер. True если файл был и применился."""
+        try:
+            p = self._state_path()
+            if not p.exists():
+                return False
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        if not isinstance(data, dict):
+            return False
+        groups = data.get("groups")
+        if isinstance(groups, list) and groups:
+            # на всякий случай проверим, что хотя бы одна группа имеет нужную форму
+            self._groups = [g for g in groups if isinstance(g, dict) and g.get("name")]
+            if not self._groups:
+                self._groups = [{"name": "Мои сервера", "type": "manual", "url": "",
+                                 "updated": "—", "auto": False, "config": None, "servers": []}]
+        cg = data.get("currentGroup")
+        if isinstance(cg, int) and 0 <= cg < len(self._groups):
+            self._currentGroup = cg
+        srv = data.get("server")
+        if isinstance(srv, str):
+            self._server = srv
+        return True
+
+    def _save_state(self) -> None:
+        """Сохранить текущее состояние групп/выбранного сервера в %LocalAppData%\\Kitsune\\groups.json.
+        Вызывается после каждого изменения подписок/серверов/избранного и при выходе."""
+        try:
+            payload = {
+                "groups": self._groups,
+                "currentGroup": self._currentGroup,
+                "server": self._server,
+            }
+            self._state_path().write_text(
+                json.dumps(payload, ensure_ascii=False, indent=1),
+                encoding="utf-8")
+        except Exception:
+            pass
 
     # ---- i18n (notify-сообщения с подстановкой args) ----
     _NOTIFY_TR = {
@@ -630,6 +655,7 @@ class Backend(QObject):
             return
         self._server = name
         self.serverChanged.emit()
+        self._save_state()
         # бесшовно: соединение не рвём, дёргаем Clash API чтобы селектор показал на новый outbound
         if self._status == "connected":
             valid = self._valid_servers_of_group()
@@ -667,6 +693,7 @@ class Backend(QObject):
             self._ping = best["ping"]
             self.statsChanged.emit()
         self.notify.emit(self._tr("bestserver", name=self._server, ping=best['ping']), "success")
+        self._save_state()
 
     @Slot()
     def simulateError(self) -> None:
@@ -1076,6 +1103,7 @@ class Backend(QObject):
             self.serverChanged.emit()
         self.currentGroupChanged.emit()
         self.serversChanged.emit()
+        self._save_state()
 
     @Slot(str, str, bool)
     def addSubscription(self, name: str, url: str, auto: bool) -> None:
@@ -1087,6 +1115,7 @@ class Backend(QObject):
             "servers": [],
         }]
         self.groupsChanged.emit()
+        self._save_state()
         self.setCurrentGroup(gi)
         self.notify.emit(self._tr("subloading"), "info")
         self._refresh_subscription(gi)
@@ -1169,6 +1198,7 @@ class Backend(QObject):
             self.serversChanged.emit()
             if g["servers"]:
                 self.pingAll()          # реальные пинги для свежих серверов (уже в треде)
+        self._save_state()
 
     @Slot(int)
     def removeGroup(self, i: int) -> None:
@@ -1185,6 +1215,7 @@ class Backend(QObject):
         self.groupsChanged.emit()
         self.currentGroupChanged.emit()
         self.serversChanged.emit()
+        self._save_state()
 
     @Slot(int)
     def updateGroup(self, i: int) -> None:
@@ -1204,6 +1235,7 @@ class Backend(QObject):
         g["auto"] = val
         self._groups = self._groups[:i] + [g] + self._groups[i + 1:]
         self.groupsChanged.emit()
+        self._save_state()
 
     # ---- сервера (профили) ----
     _PROFILE_KEYS = ["protocol", "address", "port", "uuid", "password", "method",
@@ -1232,6 +1264,7 @@ class Backend(QObject):
                         + self._groups[self._currentGroup + 1:])
         self.groupsChanged.emit()
         self.serversChanged.emit()
+        self._save_state()
 
     def _validate_server(self, srv: dict) -> tuple[bool, str]:
         """Прогоняет профиль через sing-box check (нашу же gen_config). Возвращает (ok, message).
@@ -1719,7 +1752,9 @@ class AppController(QObject):
         self._backend = backend
         self._qml_dir = qml_dir
         self._engine = None
-        self._snap = None   # снимок QML-настроек, переживает выгрузку UI
+        # снимок QML-настроек: переживает выгрузку UI И полный перезапуск приложения
+        # (load с диска при __init__; save при unload UI / quit).
+        self._snap = self._load_settings_snapshot()
 
         # кадры анимации трея: f00 = выглядывает (подключено) … fN = спрятан (отключено).
         # На светлой теме Windows добавляем белый ореол, чтобы тёмные пиксели иконки не сливались с панелью задач.
@@ -1854,6 +1889,26 @@ class AppController(QObject):
                 QMetaObject.invokeMethod(roots[0], "exportSettings")
                 self._snap = roots[0].property("settingsSnapshot")
                 self._backend.applyConfig(self._snap)
+                self._save_settings_snapshot(self._snap)
+        except Exception:
+            pass
+
+    # ---- settings persistence (диск %LocalAppData%\Kitsune\settings.json) ----
+    def _settings_path(self):
+        return engine.state_dir() / "settings.json"
+
+    def _load_settings_snapshot(self):
+        try:
+            p = self._settings_path()
+            if p.exists():
+                return p.read_text(encoding="utf-8")
+        except Exception:
+            pass
+        return None
+
+    def _save_settings_snapshot(self, snap):
+        try:
+            self._settings_path().write_text(snap or "{}", encoding="utf-8")
         except Exception:
             pass
 
@@ -1865,6 +1920,9 @@ class AppController(QObject):
     @Slot()
     def quit(self) -> None:
         try:
+            # последний капчур настроек + сохранение groups (если UI был открыт)
+            self._capture_settings()
+            self._backend._save_state()
             self._backend._core.stop()
             self._backend._set_system_proxy(False)
             # КРИТИЧНО: снимаем kill-switch правило, иначе после quit'a юзер останется без интернета

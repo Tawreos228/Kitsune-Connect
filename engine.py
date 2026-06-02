@@ -9,6 +9,7 @@ Kitsune engine — реальная обёртка над ядром sing-box.
 from __future__ import annotations
 
 import json
+import os
 import re
 import socket
 import ssl
@@ -22,6 +23,17 @@ from pathlib import Path
 
 _CORE_DIR = Path(__file__).resolve().parent / "core"
 _RULESETS_DIR = _CORE_DIR / "rulesets"
+
+
+def state_dir() -> Path:
+    """Папка для персистентного состояния (groups/settings) — %LocalAppData%\\Kitsune."""
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    p = Path(base) / "Kitsune"
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return p
 MIXED_PORT = 2080
 CLASH_HOST = "127.0.0.1"
 CLASH_PORT = 9090
