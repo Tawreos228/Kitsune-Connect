@@ -6,8 +6,18 @@ venv/
 # временные кадры/скриншоты разработки
 shot_*.png
 _*.py
-*.spec
+_*.bat
+# PyInstaller / Inno Setup артефакты сборки — не коммитим
 build/
 dist/
+dist_installer/
+# kitsune.spec и installer.iss КОММИТИМ (нужны для воспроизводимой сборки)
+!kitsune.spec
+!installer.iss
 # ядро sing-box не коммитим (большой бинарь) — тянется через core/fetch_core.py
 core/*.exe
+# временные файлы ядра / кэш иконок
+kitsune_*.json
+kitsune_*.log
+kitsune_*.db
+kitsune_icons/

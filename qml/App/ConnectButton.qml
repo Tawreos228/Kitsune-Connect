@@ -149,9 +149,9 @@ Item {
 
         Text {
             anchors.horizontalCenter: parent.horizontalCenter
-            text: root.on ? "ЗАЩИЩЕНО"
-                : root.st === "connecting" ? "ПОДКЛЮЧЕНИЕ"
-                : "ОТКЛЮЧЕНО"
+            text: root.on ? T.s("ring.protected")
+                : root.st === "connecting" ? T.s("ring.connecting")
+                : T.s("ring.disconnected")
             color: root.on ? root.softOn
                  : root.st === "connecting" ? root.softConn
                  : Theme.textMuted

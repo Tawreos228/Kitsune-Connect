@@ -55,18 +55,18 @@ ApplicationWindow {
     readonly property string icoSniff: String.fromCharCode(0xE9A9)
     readonly property string icoPort: String.fromCharCode(0xE7F4)
     readonly property string icoClock: String.fromCharCode(0xE916)
+    readonly property string icoLogs: String.fromCharCode(0xE756)        // Repair / tools-like glyph для диагностики
 
     // состояния настроек (мок)
     property bool setAutostart: false
     property bool setAutoconnect: true
     property bool setReconnect: true
     property bool setKill: false
-    property bool setBlock: true
     property bool setTray: true
     // TUN / DNS / Mux / sniffing
     property bool setTun: false
     property int  tunStack: 0          // 0 gVisor · 1 system · 2 mixed
-    property bool setStrictRoute: true
+    property bool setStrictRoute: false   // ON форсит DNS в туннель (WFP) и ломает резолвинг на части сетей
     property bool setSniff: true
     property bool setFakeIp: true
     property bool setMux: false
@@ -85,6 +85,93 @@ ApplicationWindow {
         { type: "domain", value: "*.doubleclick.net", action: "block" },
         { type: "process", value: "telegram.exe", action: "proxy" }
     ]
+
+    // Профили маршрутизации — именованные пресеты {rt*, routeRules}. Переключаются одним кликом,
+    // активный профиль авто-сохраняет правки. Дефолтный «Стандартный» не удаляется.
+    property var routingProfiles: [
+        { id: "default", name: T.s("misc.standard"),
+          rtProfile: 0, rtLan: true, rtRegionDirect: true, rtAdblock: false, rtProxyAll: false, rtFinal: 0,
+          routeRules: [
+              { type: "domain", value: "*.youtube.com", action: "proxy" },
+              { type: "geoip",  value: "RU",            action: "direct" },
+              { type: "domain", value: "*.doubleclick.net", action: "block" },
+              { type: "process", value: "telegram.exe", action: "proxy" }
+          ]
+        }
+    ]
+    property string currentProfileId: "default"
+    property bool _profileLoading: false     // подавляет авто-сейв во время applyProfile
+
+    function _findProfile(id) {
+        for (var i = 0; i < routingProfiles.length; i++)
+            if (routingProfiles[i].id === id) return routingProfiles[i]
+        return null
+    }
+    function applyProfile(id) {
+        var p = _findProfile(id)
+        if (!p) return
+        _profileLoading = true
+        currentProfileId = id
+        rtProfile       = p.rtProfile
+        rtLan           = p.rtLan
+        rtRegionDirect  = p.rtRegionDirect
+        rtAdblock       = p.rtAdblock
+        rtProxyAll      = p.rtProxyAll
+        rtFinal         = p.rtFinal
+        routeRules      = (p.routeRules || []).slice()
+        _profileLoading = false
+    }
+    function saveActiveProfile() {
+        if (_profileLoading) return
+        var arr = routingProfiles.slice()
+        var idx = -1
+        for (var i = 0; i < arr.length; i++)
+            if (arr[i].id === currentProfileId) { idx = i; break }
+        if (idx < 0) return
+        arr[idx] = {
+            id: arr[idx].id, name: arr[idx].name,
+            rtProfile: rtProfile, rtLan: rtLan, rtRegionDirect: rtRegionDirect,
+            rtAdblock: rtAdblock, rtProxyAll: rtProxyAll, rtFinal: rtFinal,
+            routeRules: routeRules.slice()
+        }
+        routingProfiles = arr
+    }
+    function createProfile(name) {
+        var nm = (name || "").trim()
+        if (!nm) return
+        var newId = "p" + Date.now()
+        var arr = routingProfiles.slice()
+        arr.push({
+            id: newId, name: nm,
+            rtProfile: rtProfile, rtLan: rtLan, rtRegionDirect: rtRegionDirect,
+            rtAdblock: rtAdblock, rtProxyAll: rtProxyAll, rtFinal: rtFinal,
+            routeRules: routeRules.slice()
+        })
+        routingProfiles = arr
+        applyProfile(newId)
+    }
+    function deleteProfile(id) {
+        if (id === "default") return       // дефолтный не удаляем
+        var arr = routingProfiles.filter(function(p) { return p.id !== id })
+        routingProfiles = arr
+        if (currentProfileId === id) applyProfile("default")
+    }
+    function renameProfile(id, newName) {
+        var nm = (newName || "").trim()
+        if (!nm) return
+        var arr = routingProfiles.slice()
+        for (var i = 0; i < arr.length; i++) {
+            if (arr[i].id === id) {
+                arr[i] = Object.assign({}, arr[i], { name: nm })
+                break
+            }
+        }
+        routingProfiles = arr
+    }
+
+    // ключ: меняется при любой правке настроек профиля — триггерит автосейв в активный
+    property string _profileKey: "" + rtProfile + rtLan + rtRegionDirect + rtAdblock + rtProxyAll + rtFinal + JSON.stringify(routeRules)
+    on_ProfileKeyChanged: saveActiveProfile()
 
     // редактируемые значения (мок)
     property string portMixed: "2080"
@@ -119,8 +206,48 @@ ApplicationWindow {
         routeRules = arr
     }
 
+    // per-app маршрутизация на странице Routing → раздел «Приложения».
+    // 3 состояния: "auto" (нет правила, юзается дефолт режима) | "proxy" (в туннель) | "direct" (мимо туннеля).
+    // direct особенно полезен в TUN-режиме (исключения: банковские клиенты, Steam, корп.VPN и т.п.).
+    property string appFilter: ""
+    function appRouteState(exe) {
+        for (var i = 0; i < routeRules.length; i++) {
+            var r = routeRules[i]
+            if (r.type === "process" && r.value === exe && (r.action === "proxy" || r.action === "direct"))
+                return r.action
+        }
+        return "auto"
+    }
+    function setAppRouteState(exe, state) {
+        // убираем существующее process-правило для exe (если есть), затем добавляем новое если state != "auto"
+        var arr = routeRules.filter(function(r) {
+            return !(r.type === "process" && r.value === exe)
+        })
+        if (state === "proxy" || state === "direct")
+            arr.push({ type: "process", value: exe, action: state })
+        routeRules = arr
+    }
+    function resetAppRules() {
+        // снять все per-app правила одним кликом
+        routeRules = routeRules.filter(function(r) { return r.type !== "process" })
+    }
+    function appsFiltered() {
+        var q = (appFilter || "").trim().toLowerCase()
+        var src = backend.appList || []
+        if (!q) return src
+        return src.filter(function(a) {
+            return (a.name || "").toLowerCase().indexOf(q) >= 0
+                || (a.exeName || "").toLowerCase().indexOf(q) >= 0
+        })
+    }
+
     // добавление подписки
     property bool addSubOpen: false
+    property bool logsOpen: false                // панель логов ядра (скрыта по умолчанию)
+    property bool importRulesOpen: false         // модалка импорта правил из чужих клиентов
+    property string importDraft: ""              // черновик вставленного JSON/YAML
+    property bool newProfileOpen: false          // модалка создания нового профиля маршрутизации
+    property string newProfileName: ""
     property string draftSubName: ""
     property string draftSubUrl: ""
     property bool draftSubAuto: true
@@ -151,12 +278,15 @@ ApplicationWindow {
     function exportSettings() {
         settingsSnapshot = JSON.stringify({
             setAutostart: setAutostart, setReconnect: setReconnect, setKill: setKill,
-            setBlock: setBlock, setTray: setTray, setLan: setLan, setStrictRoute: setStrictRoute,
+            setTray: setTray, setLan: setLan, setStrictRoute: setStrictRoute,
             setSniff: setSniff, setFakeIp: setFakeIp, setMux: setMux, tunStack: tunStack,
             muxProto: muxProto, setAutoConf: setAutoConf,
             rtProfile: rtProfile, rtLan: rtLan, rtRegionDirect: rtRegionDirect,
             rtAdblock: rtAdblock, rtProxyAll: rtProxyAll, rtFinal: rtFinal, routeRules: routeRules,
-            portMixed: portMixed, mtu: mtu, dnsRemote: dnsRemote, dnsDirect: dnsDirect
+            portMixed: portMixed, mtu: mtu, dnsRemote: dnsRemote, dnsDirect: dnsDirect,
+            lang: T.lang,
+            routingProfiles: routingProfiles, currentProfileId: currentProfileId,
+            customApps: (typeof backend !== "undefined" && backend) ? JSON.parse(backend.customAppsJson || "[]") : []
         })
     }
     function importSettings() {
@@ -165,7 +295,6 @@ ApplicationWindow {
         if (s.setAutostart !== undefined) setAutostart = s.setAutostart
         if (s.setReconnect !== undefined) setReconnect = s.setReconnect
         if (s.setKill !== undefined) setKill = s.setKill
-        if (s.setBlock !== undefined) setBlock = s.setBlock
         if (s.setTray !== undefined) setTray = s.setTray
         if (s.setLan !== undefined) setLan = s.setLan
         if (s.setStrictRoute !== undefined) setStrictRoute = s.setStrictRoute
@@ -186,7 +315,43 @@ ApplicationWindow {
         if (s.mtu !== undefined) mtu = s.mtu
         if (s.dnsRemote !== undefined) dnsRemote = s.dnsRemote
         if (s.dnsDirect !== undefined) dnsDirect = s.dnsDirect
+        if (s.lang !== undefined && (s.lang === "ru" || s.lang === "en")) T.lang = s.lang
+        // профили: восстанавливаем список и активный профиль (applyProfile перетрёт rt* и routeRules)
+        if (s.routingProfiles !== undefined && Array.isArray(s.routingProfiles) && s.routingProfiles.length > 0)
+            routingProfiles = s.routingProfiles
+        if (s.currentProfileId !== undefined && _findProfile(s.currentProfileId))
+            applyProfile(s.currentProfileId)
+        // пользовательские приложения (вручную добавленные через файл-пикер) — отдают обратно в Backend
+        if (s.customApps !== undefined && Array.isArray(s.customApps) && backend)
+            backend.setCustomAppsJson(JSON.stringify(s.customApps))
         applySubscriptionConfig()
+    }
+
+    // реактивный пуш настроек маршрутизации/DNS/mux в движок (backend.applyConfig)
+    function syncConfig() {
+        exportSettings()
+        if (typeof backend !== "undefined" && backend) backend.applyConfig(settingsSnapshot)
+    }
+    property string _cfgKey: "" + portMixed + setSniff + setMux + muxProto + setFakeIp
+        + dnsRemote + dnsDirect + rtLan + rtRegionDirect + rtAdblock + rtProxyAll
+        + rtFinal + JSON.stringify(routeRules) + tunStack + setStrictRoute + mtu + setLan
+    on_CfgKeyChanged: syncConfig()
+    Component.onCompleted: {
+        syncConfig()
+        if (backend) {
+            backend.checkCoreUpdate()
+            backend.scanApps()
+            setAutostart = backend.isAutostartEnabled()   // синк UI-тумблера с реальным состоянием реестра
+            backend.setReconnectEnabled(setReconnect)     // прокинуть начальное значение watchdog'а
+            backend.setKillSwitchEnabled(setKill)         // прокинуть начальное значение kill-switch
+            backend.setLang(T.lang)                       // i18n: язык Backend-notify
+        }
+    }
+
+    // i18n: при смене языка в UI синкаем в Backend (для notify-сообщений)
+    Connections {
+        target: T
+        function onLangChanged() { if (backend) backend.setLang(T.lang) }
     }
 
     // редактор профиля сервера
@@ -210,6 +375,12 @@ ApplicationWindow {
     property string epServiceName: ""
     property string epWgKey: ""
     property string epFlow: ""
+    // WireGuard-only:
+    property string epPeerKey: ""
+    property string epLocalAddr: "172.16.0.2/32"
+    property string epAllowedIps: "0.0.0.0/0"
+    property string epWgMtu: "1420"
+    property string epPsk: ""
     readonly property var protoList: ["vless", "vmess", "trojan", "shadowsocks", "wireguard"]
     readonly property var ssMethods: ["aes-256-gcm", "chacha20-ietf-poly1305", "2022-blake3-aes-256-gcm"]
     readonly property var transports: ["tcp", "ws", "grpc", "xhttp"]
@@ -222,6 +393,7 @@ ApplicationWindow {
             epTls = true; epSni = ""; epReality = false; epPbk = ""; epSid = ""
             epTransport = "tcp"; epPath = ""; epHost = ""; epServiceName = ""
             epWgKey = ""; epFlow = ""
+            epPeerKey = ""; epLocalAddr = "172.16.0.2/32"; epAllowedIps = "0.0.0.0/0"; epWgMtu = "1420"; epPsk = ""
         } else {
             var s = backend.servers[index] || ({})
             epName = s.name || s.country || ""
@@ -242,6 +414,11 @@ ApplicationWindow {
             epServiceName = s.serviceName || ""
             epWgKey = s.wgKey || ""
             epFlow = s.flow || ""
+            epPeerKey = s.peerKey || ""
+            epLocalAddr = s.localAddr || "172.16.0.2/32"
+            epAllowedIps = s.allowedIps || "0.0.0.0/0"
+            epWgMtu = (s.mtu !== undefined && s.mtu !== "") ? String(s.mtu) : "1420"
+            epPsk = s.psk || ""
         }
         serverEditorOpen = true
     }
@@ -252,7 +429,9 @@ ApplicationWindow {
             uuid: epUuid, password: epPassword, method: epMethod, tls: epTls,
             sni: epSni, reality: epReality, pbk: epPbk, sid: epSid,
             transport: epTransport, path: epPath, host: epHost,
-            serviceName: epServiceName, wgKey: epWgKey, flow: epFlow
+            serviceName: epServiceName, wgKey: epWgKey, flow: epFlow,
+            peerKey: epPeerKey, localAddr: epLocalAddr, allowedIps: epAllowedIps,
+            mtu: epWgMtu, psk: epPsk
         }
         if (epIndex < 0) backend.addServer(d)
         else backend.updateServer(epIndex, d)
@@ -286,10 +465,10 @@ ApplicationWindow {
     function ctxName() { var s = backend.servers[ctxIndex]; return s ? (s.country + " · " + s.city) : "" }
 
     readonly property var navModel: [
-        { icon: icoDashboard, label: "Dashboard" },
-        { icon: icoLocations, label: "Locations" },
-        { icon: icoRouting, label: "Routing" },
-        { icon: icoSettings, label: "Settings" }
+        { icon: icoDashboard, key: "nav.dashboard" },
+        { icon: icoLocations, key: "nav.locations" },
+        { icon: icoRouting,   key: "nav.routing" },
+        { icon: icoSettings,  key: "nav.settings" }
     ]
     function pingFor(name) {
         var s = backend.servers
@@ -304,7 +483,7 @@ ApplicationWindow {
         return "··"
     }
     function fmtTraffic(mb) {
-        return mb >= 1024 ? (mb / 1024).toFixed(2) + " ГБ" : mb.toFixed(1) + " МБ"
+        return mb >= 1024 ? (mb / 1024).toFixed(2) + T.s("units.gb") : mb.toFixed(1) + T.s("units.mb")
     }
     function fmtTime(s) {
         var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60
@@ -320,7 +499,7 @@ ApplicationWindow {
         if (logoTaps >= 5) {
             logoTaps = 0
             Theme.scheme = (Theme.scheme === "kitsune" ? "dark" : "kitsune")
-            toast.show(Theme.scheme === "kitsune" ? "🦊 Режим Китсунэ включён" : "Обычная тема", "info")
+            toast.show(Theme.scheme === "kitsune" ? T.s("misc.bigfox") : T.s("misc.normalth"), "info")
         }
     }
 
@@ -336,7 +515,7 @@ ApplicationWindow {
         Item { Layout.fillHeight: true }
         Text { Layout.alignment: Qt.AlignHCenter; text: glyph; font.family: Theme.iconFamily; font.pixelSize: 44; color: Theme.textMuted }
         Text { Layout.alignment: Qt.AlignHCenter; Layout.topMargin: 12; text: caption; color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 18; font.weight: Font.Medium }
-        Text { Layout.alignment: Qt.AlignHCenter; Layout.topMargin: 2; text: "скоро"; color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 13 }
+        Text { Layout.alignment: Qt.AlignHCenter; Layout.topMargin: 2; text: T.s("misc.soon"); color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 13 }
         Item { Layout.fillHeight: true }
     }
 
@@ -447,7 +626,7 @@ ApplicationWindow {
                                         Behavior on color { ColorAnimation { duration: Theme.durBase } }
                                     }
                                     Text {
-                                        text: navItem.modelData.label
+                                        text: T.s(navItem.modelData.key)
                                         font.family: Theme.fontFamily
                                         font.pixelSize: 14
                                         font.weight: navItem.active ? Font.DemiBold : Font.Normal
@@ -455,6 +634,16 @@ ApplicationWindow {
                                         Behavior on color { ColorAnimation { duration: Theme.durBase } }
                                     }
                                     Item { Layout.fillWidth: true }
+                                    // деликатная точка — апдейт ядра доступен (видна только на Settings)
+                                    Rectangle {
+                                        visible: navItem.modelData.key === "nav.settings" && backend.coreUpdateAvailable
+                                        width: 7; height: 7; radius: 3.5
+                                        color: Theme.accent
+                                        Layout.alignment: Qt.AlignVCenter
+                                        Layout.rightMargin: 2
+                                        opacity: visible ? 1 : 0
+                                        Behavior on opacity { NumberAnimation { duration: Theme.durBase } }
+                                    }
                                 }
 
                                 MouseArea {
@@ -481,8 +670,9 @@ ApplicationWindow {
                         Behavior on color { ColorAnimation { duration: Theme.durBase } }
                     }
                     Text {
-                        text: backend.status === "connected" ? "Активно"
-                            : backend.status === "connecting" ? "Соединение…" : "Не в сети"
+                        text: backend.status === "connected" ? T.s("statusbar.active")
+                            : backend.status === "connecting" ? T.s("statusbar.connecting")
+                            : T.s("statusbar.offline")
                         color: Theme.textSub
                         font.family: Theme.fontFamily
                         font.pixelSize: 12
@@ -603,7 +793,7 @@ ApplicationWindow {
                     id: ipLine
                     Layout.alignment: Qt.AlignHCenter
                     Layout.topMargin: 4
-                    text: backend.status === "connected" ? "Мой IP · " + backend.exitIp : "Соединение не защищено"
+                    text: backend.status === "connected" ? T.s("loc.myip") + backend.exitIp : T.s("loc.unsecured")
                     color: backend.status === "connected" && ipMouse.containsMouse ? Theme.text : Theme.textSub
                     font.family: Theme.fontFamily
                     font.pixelSize: 13
@@ -663,7 +853,7 @@ ApplicationWindow {
                 // прототип: показать всплывающую ошибку
                 Text {
                     Layout.alignment: Qt.AlignHCenter
-                    text: "показать пример ошибки"
+                    text: T.s("misc.demoerr")
                     color: Theme.textMuted
                     font.family: Theme.fontFamily
                     font.pixelSize: 11
@@ -704,7 +894,7 @@ ApplicationWindow {
                 // заголовок + добавить подписку
                 RowLayout {
                     Layout.fillWidth: true
-                    Text { text: "Локации"; color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 22; font.weight: Font.DemiBold }
+                    Text { text: T.s("page.locations"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 22; font.weight: Font.DemiBold }
                     Item { Layout.fillWidth: true }
                     Rectangle {
                         width: pasteRow.implicitWidth + 26; height: 34; radius: 17
@@ -713,7 +903,7 @@ ApplicationWindow {
                         Row {
                             id: pasteRow; anchors.centerIn: parent; spacing: 6
                             Text { text: String.fromCharCode(0xE77F); font.family: Theme.iconFamily; font.pixelSize: 14; color: Theme.text; anchors.verticalCenter: parent.verticalCenter }
-                            Text { text: "Вставить"; color: Theme.text; font.pixelSize: 13; font.weight: Font.Medium; font.family: Theme.fontFamily; anchors.verticalCenter: parent.verticalCenter }
+                            Text { text: T.s("btn.paste"); color: Theme.text; font.pixelSize: 13; font.weight: Font.Medium; font.family: Theme.fontFamily; anchors.verticalCenter: parent.verticalCenter }
                         }
                         HoverHandler { id: pasteHover; cursorShape: Qt.PointingHandCursor }
                         TapHandler { onTapped: backend.importFromClipboard() }
@@ -726,7 +916,7 @@ ApplicationWindow {
                         Row {
                             id: addSubRow; anchors.centerIn: parent; spacing: 6
                             Text { text: "+"; color: "white"; font.pixelSize: 17; font.weight: Font.Bold; font.family: Theme.fontFamily; anchors.verticalCenter: parent.verticalCenter }
-                            Text { text: "Подписка"; color: "white"; font.pixelSize: 13; font.weight: Font.DemiBold; font.family: Theme.fontFamily; anchors.verticalCenter: parent.verticalCenter }
+                            Text { text: T.s("btn.subscription"); color: "white"; font.pixelSize: 13; font.weight: Font.DemiBold; font.family: Theme.fontFamily; anchors.verticalCenter: parent.verticalCenter }
                         }
                         HoverHandler { id: addSubHover; cursorShape: Qt.PointingHandCursor }
                         TapHandler { onTapped: win.openAddSub() }
@@ -781,9 +971,9 @@ ApplicationWindow {
                         ColumnLayout {
                             Layout.fillWidth: true; Layout.alignment: Qt.AlignVCenter; spacing: 1
                             Text { text: subInfo.g.url || ""; color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 12; elide: Text.ElideMiddle; Layout.fillWidth: true }
-                            Text { text: "Обновлено: " + (subInfo.g.updated || "—"); color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11 }
+                            Text { text: T.s("loc.updated") + (subInfo.g.updated || "—"); color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11 }
                         }
-                        Text { text: "Авто"; color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; Layout.alignment: Qt.AlignVCenter }
+                        Text { text: T.s("btn.auto"); color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; Layout.alignment: Qt.AlignVCenter }
                         Toggle {
                             Layout.alignment: Qt.AlignVCenter
                             implicitWidth: 40; implicitHeight: 24
@@ -791,7 +981,7 @@ ApplicationWindow {
                             onToggled: backend.setGroupAuto(backend.currentGroup, value)
                         }
                         IconButton { Layout.alignment: Qt.AlignVCenter; glyph: win.icoReconnect; diameter: 34; onClicked: backend.updateGroup(backend.currentGroup) }
-                        IconButton { Layout.alignment: Qt.AlignVCenter; glyph: String.fromCharCode(0xE74D); diameter: 34; onClicked: win.askConfirm("Удалить подписку «" + (subInfo.g.name || "") + "»?", function() { backend.removeGroup(backend.currentGroup) }) }
+                        IconButton { Layout.alignment: Qt.AlignVCenter; glyph: String.fromCharCode(0xE74D); diameter: 34; onClicked: win.askConfirm(T.s("confirm.delsub") + (subInfo.g.name || "") + T.s("confirm.tail"), function() { backend.removeGroup(backend.currentGroup) }) }
                     }
                 }
 
@@ -813,7 +1003,7 @@ ApplicationWindow {
                             TextField {
                                 id: searchTf
                                 Layout.fillWidth: true; Layout.alignment: Qt.AlignVCenter
-                                placeholderText: "Поиск по серверам"
+                                placeholderText: T.s("loc.searchph")
                                 placeholderTextColor: Theme.textMuted
                                 color: Theme.text
                                 font.family: Theme.fontFamily; font.pixelSize: 13
@@ -834,7 +1024,7 @@ ApplicationWindow {
                         Row {
                             id: sortRow; anchors.centerIn: parent; spacing: 6
                             Text { text: String.fromCharCode(0xE74A); font.family: Theme.iconFamily; font.pixelSize: 13; color: sortBtn.on ? Theme.accent : Theme.textSub; anchors.verticalCenter: parent.verticalCenter }
-                            Text { text: "Пинг"; color: sortBtn.on ? Theme.accent : Theme.text; font.family: Theme.fontFamily; font.pixelSize: 13; font.weight: Font.Medium; anchors.verticalCenter: parent.verticalCenter }
+                            Text { text: T.s("btn.ping"); color: sortBtn.on ? Theme.accent : Theme.text; font.family: Theme.fontFamily; font.pixelSize: 13; font.weight: Font.Medium; anchors.verticalCenter: parent.verticalCenter }
                         }
                         HoverHandler { cursorShape: Qt.PointingHandCursor }
                         TapHandler { onTapped: locPage.sortMode = (locPage.sortMode === 1 ? 0 : 1) }
@@ -859,7 +1049,7 @@ ApplicationWindow {
                         Row {
                             id: autoRow; anchors.centerIn: parent; spacing: 6
                             Text { text: String.fromCharCode(0xE945); font.family: Theme.iconFamily; font.pixelSize: 14; color: "white"; anchors.verticalCenter: parent.verticalCenter }
-                            Text { text: "Авто"; color: "white"; font.family: Theme.fontFamily; font.pixelSize: 13; font.weight: Font.DemiBold; anchors.verticalCenter: parent.verticalCenter }
+                            Text { text: T.s("btn.auto"); color: "white"; font.family: Theme.fontFamily; font.pixelSize: 13; font.weight: Font.DemiBold; anchors.verticalCenter: parent.verticalCenter }
                         }
                         HoverHandler { id: autoHover; cursorShape: Qt.PointingHandCursor }
                         TapHandler { onTapped: backend.selectBest() }
@@ -873,6 +1063,7 @@ ApplicationWindow {
                     clip: true
                     spacing: 8
                     boundsBehavior: Flickable.StopAtBounds
+                    ScrollBar.vertical: ThinScrollBar {}
                     visible: locPage.filtered.length > 0
                     model: locPage.filtered
                     delegate: ServerCard {
@@ -901,11 +1092,11 @@ ApplicationWindow {
                     visible: locPage.filtered.length === 0
                     Item { Layout.fillHeight: true }
                     Text { Layout.alignment: Qt.AlignHCenter; text: locPage.searchText.length > 0 ? String.fromCharCode(0xE721) : String.fromCharCode(0xE774); font.family: Theme.iconFamily; font.pixelSize: 40; color: Theme.textMuted }
-                    Text { Layout.alignment: Qt.AlignHCenter; Layout.topMargin: 12; text: locPage.searchText.length > 0 ? "Ничего не найдено" : "Здесь пока пусто"; color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 16; font.weight: Font.Medium }
+                    Text { Layout.alignment: Qt.AlignHCenter; Layout.topMargin: 12; text: locPage.searchText.length > 0 ? T.s("loc.notfound") : T.s("loc.empty"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 16; font.weight: Font.Medium }
                     Text {
                         Layout.alignment: Qt.AlignHCenter; Layout.topMargin: 4; Layout.maximumWidth: 380
                         horizontalAlignment: Text.AlignHCenter; wrapMode: Text.WordWrap
-                        text: locPage.searchText.length > 0 ? ("По запросу «" + locPage.searchText + "» ничего не найдено") : "Вставьте ссылку из буфера или добавьте сервер вручную"
+                        text: locPage.searchText.length > 0 ? (T.s("loc.notfoundq") + locPage.searchText + T.s("loc.notfoundtail")) : T.s("loc.emptyhint")
                         color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 13
                     }
                     RowLayout {
@@ -919,7 +1110,7 @@ ApplicationWindow {
                             Row {
                                 id: esPasteRow; anchors.centerIn: parent; spacing: 6
                                 Text { text: String.fromCharCode(0xE77F); font.family: Theme.iconFamily; font.pixelSize: 14; color: Theme.text; anchors.verticalCenter: parent.verticalCenter }
-                                Text { text: "Вставить"; color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 13; anchors.verticalCenter: parent.verticalCenter }
+                                Text { text: T.s("btn.paste"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 13; anchors.verticalCenter: parent.verticalCenter }
                             }
                             HoverHandler { id: esPasteHover; cursorShape: Qt.PointingHandCursor }
                             TapHandler { onTapped: backend.importFromClipboard() }
@@ -930,7 +1121,7 @@ ApplicationWindow {
                             Row {
                                 id: esAddRow; anchors.centerIn: parent; spacing: 6
                                 Text { text: "+"; color: "white"; font.pixelSize: 16; font.weight: Font.Bold; font.family: Theme.fontFamily; anchors.verticalCenter: parent.verticalCenter }
-                                Text { text: "Сервер"; color: "white"; font.family: Theme.fontFamily; font.pixelSize: 13; font.weight: Font.DemiBold; anchors.verticalCenter: parent.verticalCenter }
+                                Text { text: T.s("btn.server"); color: "white"; font.family: Theme.fontFamily; font.pixelSize: 13; font.weight: Font.DemiBold; anchors.verticalCenter: parent.verticalCenter }
                             }
                             HoverHandler { id: esAddHover; cursorShape: Qt.PointingHandCursor }
                             TapHandler { onTapped: win.openServerEditor(-1) }
@@ -951,6 +1142,7 @@ ApplicationWindow {
                 contentHeight: settingsCol.implicitHeight
                 clip: true
                 boundsBehavior: Flickable.StopAtBounds
+                ScrollBar.vertical: ThinScrollBar {}
 
                 ColumnLayout {
                     id: settingsCol
@@ -958,7 +1150,7 @@ ApplicationWindow {
                     spacing: 10
 
                     Text {
-                        text: "Настройки"
+                        text: T.s("page.settings")
                         color: Theme.text
                         font.family: Theme.fontFamily
                         font.pixelSize: 22
@@ -977,21 +1169,42 @@ ApplicationWindow {
                         RowLayout {
                             anchors.fill: parent; anchors.leftMargin: 14; anchors.rightMargin: 12; spacing: 10
                             Text { text: win.icoLink; font.family: Theme.iconFamily; font.pixelSize: 16; color: Theme.accent; Layout.alignment: Qt.AlignVCenter }
-                            Text { Layout.fillWidth: true; Layout.alignment: Qt.AlignVCenter; text: "Часть настроек берётся из подписки «" + win.managedSub + "»"; color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 12; wrapMode: Text.WordWrap }
+                            Text { Layout.fillWidth: true; Layout.alignment: Qt.AlignVCenter; text: T.s("loc.fromsub") + win.managedSub + "»"; color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 12; wrapMode: Text.WordWrap }
                             Rectangle {
                                 Layout.alignment: Qt.AlignVCenter
                                 width: ov.width + 24; height: 30; radius: 15
                                 color: ovHover.hovered ? Theme.hover : "transparent"
                                 border.width: 1; border.color: Theme.stroke
-                                Text { id: ov; anchors.centerIn: parent; text: "Вручную"; color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 12; font.weight: Font.Medium }
+                                Text { id: ov; anchors.centerIn: parent; text: T.s("btn.manual"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 12; font.weight: Font.Medium }
                                 HoverHandler { id: ovHover; cursorShape: Qt.PointingHandCursor }
                                 TapHandler { onTapped: win.setAutoConf = false }
                             }
                         }
                     }
 
+                    // === ЯЗЫК / LANGUAGE ===
+                    Text { text: T.s("sec.language"); color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1 }
+                    Rectangle {
+                        Layout.fillWidth: true
+                        radius: Theme.radius
+                        color: Theme.surface
+                        border.width: 1; border.color: Theme.stroke
+                        implicitHeight: langCol.implicitHeight
+                        ColumnLayout {
+                            id: langCol; width: parent.width; spacing: 0
+                            SettingRow {
+                                Layout.fillWidth: true
+                                glyph: String.fromCharCode(0xF2B7)   // globe-like glyph
+                                label: T.s("label.lang")
+                                sub: T.lang === "ru" ? T.s("misc.langnames") : T.s("misc.langnames.en")
+                                // язык — это имя самого языка, не переводим
+                                control: Segmented { width: 200; options: [T.s("misc.langname.ru"), T.s("misc.langname.en")]; currentIndex: T.lang === "en" ? 1 : 0; onSelected: T.lang = (index === 1 ? "en" : "ru") }
+                            }
+                        }
+                    }
+
                     // === ИНТЕРФЕЙС ===
-                    Text { text: "ИНТЕРФЕЙС"; color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1 }
+                    Text { text: T.s("sec.interface"); color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1 }
                     Rectangle {
                         Layout.fillWidth: true
                         radius: Theme.radius
@@ -1005,20 +1218,73 @@ ApplicationWindow {
                             spacing: 0
                             SettingRow {
                                 Layout.fillWidth: true
-                                glyph: win.icoTheme; label: "Тёмная тема"; sub: "Светлое / тёмное оформление"
+                                glyph: win.icoTheme; label: T.s("set.theme"); sub: T.s("set.theme.sub")
                                 control: ThemeToggle {}
                             }
                             Rectangle { Layout.fillWidth: true; Layout.leftMargin: 50; height: 1; color: Theme.stroke }
                             SettingRow {
                                 Layout.fillWidth: true
-                                glyph: win.icoTray; label: "Сворачивать в трей"; sub: "Прятать окно вместо закрытия"
+                                glyph: win.icoTray; label: T.s("set.tray"); sub: T.s("set.tray.sub")
                                 control: Toggle { checked: win.setTray; onToggled: win.setTray = value }
                             }
                         }
                     }
 
+                    // === ЯДРО (sing-box) — версии + автообнова ===
+                    Text { text: T.s("sec.core"); color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1; Layout.topMargin: 8 }
+                    Rectangle {
+                        Layout.fillWidth: true; radius: Theme.radius; color: Theme.surface; border.width: 1; border.color: Theme.stroke
+                        implicitHeight: coreCol.implicitHeight
+                        ColumnLayout {
+                            id: coreCol; width: parent.width; spacing: 0
+
+                            // sing-box (официальный, наш fallback) — авто-обновляется
+                            SettingRow {
+                                Layout.fillWidth: true
+                                glyph: win.icoReconnect
+                                label: "sing-box.exe"
+                                sub: (backend.coreVersion || T.s("sub.notinstalled")) +
+                                     (backend.coreLatest ? "  ·  " + T.s("misc.available") + ": " + backend.coreLatest : "")
+                                control: Rectangle {
+                                    visible: backend.coreUpdateAvailable
+                                    width: 110; height: 32; radius: 9
+                                    color: backend.coreUpdating
+                                        ? Qt.rgba(0,0,0,0)
+                                        : (updCoreHover.hovered ? Theme.accentSoft : "transparent")
+                                    border.width: 1
+                                    border.color: backend.coreUpdating ? Theme.stroke : Theme.accent
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: backend.coreUpdating ? T.s("sub.loading") : T.s("sub.update")
+                                        color: backend.coreUpdating ? Theme.textSub : Theme.accent
+                                        font.family: Theme.fontFamily; font.pixelSize: 13; font.weight: Font.DemiBold
+                                    }
+                                    HoverHandler { id: updCoreHover; enabled: !backend.coreUpdating; cursorShape: Qt.PointingHandCursor }
+                                    TapHandler { enabled: !backend.coreUpdating; onTapped: backend.updateCore() }
+                                }
+                            }
+                            Rectangle { Layout.fillWidth: true; Layout.leftMargin: 50; height: 1; color: Theme.stroke }
+
+                            // строка действий — ручная проверка обновлений
+                            SettingRow {
+                                Layout.fillWidth: true
+                                glyph: win.icoClock
+                                label: T.s("set.checkup")
+                                sub: T.s("set.checkup.sub")
+                                control: Rectangle {
+                                    width: 110; height: 32; radius: 9
+                                    color: checkUpdHover.hovered ? Theme.hover : "transparent"
+                                    border.width: 1; border.color: Theme.stroke
+                                    Text { anchors.centerIn: parent; text: T.s("btn.check"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 13 }
+                                    HoverHandler { id: checkUpdHover; cursorShape: Qt.PointingHandCursor }
+                                    TapHandler { onTapped: backend.checkCoreUpdateForce() }
+                                }
+                            }
+                        }
+                    }
+
                     // === ПОДПИСКА ===
-                    Text { text: "ПОДПИСКА"; color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1; Layout.topMargin: 8 }
+                    Text { text: T.s("sec.subscription"); color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1; Layout.topMargin: 8 }
                     Rectangle {
                         Layout.fillWidth: true; radius: Theme.radius; color: Theme.surface; border.width: 1; border.color: Theme.stroke
                         implicitHeight: subCol.implicitHeight
@@ -1026,15 +1292,15 @@ ApplicationWindow {
                             id: subCol; width: parent.width; spacing: 0
                             SettingRow {
                                 Layout.fillWidth: true
-                                glyph: win.icoLink; label: "Подстраивать под подписку"
-                                sub: "Применять маршрутизацию / DNS / параметры из подписки"
+                                glyph: win.icoLink; label: T.s("set.autoconf")
+                                sub: T.s("set.autoconf.sub")
                                 control: Toggle { checked: win.setAutoConf; onToggled: win.setAutoConf = value }
                             }
                         }
                     }
 
                     // === ПОДКЛЮЧЕНИЕ ===
-                    Text { text: "ПОДКЛЮЧЕНИЕ"; color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1; Layout.topMargin: 8 }
+                    Text { text: T.s("sec.connection"); color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1; Layout.topMargin: 8 }
                     Rectangle {
                         Layout.fillWidth: true
                         radius: Theme.radius
@@ -1048,33 +1314,39 @@ ApplicationWindow {
                             spacing: 0
                             SettingRow {
                                 Layout.fillWidth: true
-                                glyph: win.icoAutostart; label: "Автозапуск с системой"; sub: "Запускать при входе в Windows"
-                                control: Toggle { checked: win.setAutostart; onToggled: win.setAutostart = value }
+                                glyph: win.icoAutostart; label: T.s("set.autostart"); sub: T.s("set.autostart.sub")
+                                control: Toggle {
+                                    checked: win.setAutostart
+                                    onToggled: { win.setAutostart = value; backend.setAutostart(value) }
+                                }
                             }
                             Rectangle { Layout.fillWidth: true; Layout.leftMargin: 50; height: 1; color: Theme.stroke }
                             SettingRow {
                                 Layout.fillWidth: true
-                                glyph: win.icoLink; label: "Автоподключение"; sub: "Подключаться сразу при запуске"
+                                glyph: win.icoLink; label: T.s("set.autoconnect"); sub: T.s("set.autoconnect.sub")
                                 control: Toggle { checked: backend.autoConnect; onToggled: backend.autoConnect = value }
                             }
                             Rectangle { visible: backend.autoConnect; Layout.fillWidth: true; Layout.leftMargin: 50; height: 1; color: Theme.stroke }
                             SettingRow {
                                 visible: backend.autoConnect
                                 Layout.fillWidth: true
-                                glyph: win.icoReconnect; label: "Подключать к"; sub: "Последнему выбранному или быстрейшему по пингу"
-                                control: Segmented { width: 220; options: ["Последний", "Быстрейший"]; currentIndex: backend.autoConnectMode; onSelected: backend.autoConnectMode = index }
+                                glyph: win.icoReconnect; label: T.s("set.connectto"); sub: T.s("set.connectto.sub")
+                                control: Segmented { width: 220; options: [T.s("seg.last"), T.s("seg.fastest")]; currentIndex: backend.autoConnectMode; onSelected: backend.autoConnectMode = index }
                             }
                             Rectangle { Layout.fillWidth: true; Layout.leftMargin: 50; height: 1; color: Theme.stroke }
                             SettingRow {
                                 Layout.fillWidth: true
-                                glyph: win.icoReconnect; label: "Авто-реконнект"; sub: "Восстанавливать соединение при разрыве"
-                                control: Toggle { checked: win.setReconnect; onToggled: win.setReconnect = value }
+                                glyph: win.icoReconnect; label: T.s("set.reconnect"); sub: T.s("set.reconnect.sub")
+                                control: Toggle {
+                                    checked: win.setReconnect
+                                    onToggled: { win.setReconnect = value; backend.setReconnectEnabled(value) }
+                                }
                             }
                         }
                     }
 
                     // === ГОРЯЧАЯ КЛАВИША ===
-                    Text { text: "ГОРЯЧАЯ КЛАВИША"; color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1; Layout.topMargin: 8 }
+                    Text { text: T.s("sec.hotkey"); color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1; Layout.topMargin: 8 }
                     Rectangle {
                         Layout.fillWidth: true; radius: Theme.radius; color: Theme.surface; border.width: 1; border.color: Theme.stroke
                         implicitHeight: hkCol.implicitHeight
@@ -1082,20 +1354,20 @@ ApplicationWindow {
                             id: hkCol; width: parent.width; spacing: 0
                             SettingRow {
                                 Layout.fillWidth: true
-                                glyph: String.fromCharCode(0xE765); label: "Глобальный хоткей"; sub: "Вкл/выкл VPN даже когда окно свёрнуто"
+                                glyph: String.fromCharCode(0xE765); label: T.s("set.hotkey"); sub: T.s("set.hotkey.sub")
                                 control: Toggle { checked: backend.hotkeyEnabled; onToggled: backend.hotkeyEnabled = value }
                             }
                             Rectangle { Layout.fillWidth: true; Layout.leftMargin: 50; height: 1; color: Theme.stroke }
                             SettingRow {
                                 Layout.fillWidth: true
-                                glyph: String.fromCharCode(0xE70F); label: "Комбинация"; sub: "Модификатор + буква/цифра"
+                                glyph: String.fromCharCode(0xE70F); label: T.s("set.combo"); sub: T.s("set.combo.sub")
                                 control: HotkeyField {}
                             }
                         }
                     }
 
                     // === БЕЗОПАСНОСТЬ ===
-                    Text { text: "БЕЗОПАСНОСТЬ"; color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1; Layout.topMargin: 8 }
+                    Text { text: T.s("sec.security"); color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1; Layout.topMargin: 8 }
                     Rectangle {
                         Layout.fillWidth: true
                         radius: Theme.radius
@@ -1109,75 +1381,99 @@ ApplicationWindow {
                             spacing: 0
                             SettingRow {
                                 Layout.fillWidth: true
-                                glyph: win.icoShield; label: "Kill-switch"; sub: "Резать интернет, если VPN отвалился"
-                                control: Toggle { checked: win.setKill; onToggled: win.setKill = value }
-                            }
-                            Rectangle { Layout.fillWidth: true; Layout.leftMargin: 50; height: 1; color: Theme.stroke }
-                            SettingRow {
-                                Layout.fillWidth: true
-                                glyph: win.icoLock; label: "Блокировать при разрыве"; sub: "Не пропускать трафик мимо туннеля"
-                                control: Toggle { checked: win.setBlock; onToggled: win.setBlock = value }
+                                glyph: win.icoShield; label: T.s("set.killswitch")
+                                sub: T.s("set.killswitch.sub")
+                                control: Toggle {
+                                    checked: win.setKill
+                                    onToggled: { win.setKill = value; backend.setKillSwitchEnabled(value) }
+                                }
                             }
                         }
                     }
 
                     // === ВХОДЯЩЕЕ ===
-                    Text { text: "ВХОДЯЩЕЕ СОЕДИНЕНИЕ"; color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1; Layout.topMargin: 8 }
+                    Text { text: T.s("sec.inbound"); color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1; Layout.topMargin: 8 }
                     Rectangle {
                         Layout.fillWidth: true; radius: Theme.radius; color: Theme.surface; border.width: 1; border.color: Theme.stroke
                         implicitHeight: inCol.implicitHeight
                         ColumnLayout {
                             id: inCol; width: parent.width; spacing: 0
-                            SettingRow { Layout.fillWidth: true; glyph: win.icoPort; label: "Локальный порт (mixed)"; sub: "SOCKS + HTTP на одном порту"; control: ValueField { fieldWidth: 90; numeric: true; text: win.portMixed; onEdited: win.portMixed = value } }
+                            SettingRow { Layout.fillWidth: true; glyph: win.icoPort; label: T.s("set.port"); sub: T.s("set.port.sub"); control: ValueField { fieldWidth: 90; numeric: true; text: win.portMixed; onEdited: win.portMixed = value } }
                             Rectangle { Layout.fillWidth: true; Layout.leftMargin: 50; height: 1; color: Theme.stroke }
-                            SettingRow { Layout.fillWidth: true; glyph: win.icoLink; label: "Разрешить из LAN"; sub: "Принимать подключения из локальной сети"; control: Toggle { checked: win.setLan; onToggled: win.setLan = value } }
+                            SettingRow { Layout.fillWidth: true; glyph: win.icoLink; label: T.s("set.lan"); sub: T.s("set.lan.sub"); control: Toggle { checked: win.setLan; onToggled: win.setLan = value } }
                             Rectangle { Layout.fillWidth: true; Layout.leftMargin: 50; height: 1; color: Theme.stroke }
-                            SettingRow { Layout.fillWidth: true; glyph: win.icoSniff; label: "Sniffing"; sub: "Определять домен для маршрутизации"; control: Toggle { checked: win.setSniff; onToggled: win.setSniff = value } }
+                            SettingRow { Layout.fillWidth: true; glyph: win.icoSniff; label: T.s("set.sniff"); sub: T.s("set.sniff.sub"); control: Toggle { checked: win.setSniff; onToggled: win.setSniff = value } }
                         }
                     }
 
                     // === TUN ===
-                    Text { text: "РЕЖИМ TUN"; color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1; Layout.topMargin: 8 }
+                    Text { text: T.s("sec.tun"); color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1; Layout.topMargin: 8 }
                     Rectangle {
                         Layout.fillWidth: true; radius: Theme.radius; color: Theme.surface; border.width: 1; border.color: Theme.stroke
                         implicitHeight: tunCol.implicitHeight
                         ColumnLayout {
                             id: tunCol; width: parent.width; spacing: 0
-                            SettingRow { Layout.fillWidth: true; glyph: win.icoTun; label: "Режим TUN"; sub: "Системный туннель (нужны права админа)"; control: Toggle { checked: win.setTun; onToggled: win.setTun = value } }
+                            SettingRow { Layout.fillWidth: true; glyph: win.icoTun; label: T.s("set.tunmode"); sub: T.s("set.tunmode.sub"); control: Toggle { checked: backend.mode === "tun"; onToggled: backend.setMode(value ? "tun" : "proxy") } }
                             Rectangle { Layout.fillWidth: true; Layout.leftMargin: 50; height: 1; color: Theme.stroke }
-                            SettingRow { Layout.fillWidth: true; glyph: win.icoTun; label: "Сетевой стек"; control: Segmented { width: 210; options: ["gVisor", "system", "mixed"]; currentIndex: win.tunStack; onSelected: win.tunStack = index } }
+                            SettingRow { Layout.fillWidth: true; glyph: win.icoTun; label: T.s("set.tunstack"); control: Segmented { width: 210; options: ["gVisor", "system", "mixed"]; currentIndex: win.tunStack; onSelected: win.tunStack = index } }
                             Rectangle { Layout.fillWidth: true; Layout.leftMargin: 50; height: 1; color: Theme.stroke }
                             SettingRow { Layout.fillWidth: true; glyph: win.icoPort; label: "MTU"; control: ValueField { fieldWidth: 90; numeric: true; text: win.mtu; onEdited: win.mtu = value } }
                             Rectangle { Layout.fillWidth: true; Layout.leftMargin: 50; height: 1; color: Theme.stroke }
-                            SettingRow { Layout.fillWidth: true; glyph: win.icoShield; label: "Strict route"; sub: "Жёсткая маршрутизация всего трафика"; control: Toggle { checked: win.setStrictRoute; onToggled: win.setStrictRoute = value } }
+                            SettingRow { Layout.fillWidth: true; glyph: win.icoShield; label: T.s("set.strict"); sub: T.s("set.strict.sub"); control: Toggle { checked: win.setStrictRoute; onToggled: win.setStrictRoute = value } }
                         }
                     }
 
                     // === DNS ===
-                    Text { text: "DNS"; color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1; Layout.topMargin: 8 }
+                    Text { text: T.s("sec.dns"); color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1; Layout.topMargin: 8 }
                     Rectangle {
                         Layout.fillWidth: true; radius: Theme.radius; color: Theme.surface; border.width: 1; border.color: Theme.stroke
                         implicitHeight: dnsCol.implicitHeight
                         ColumnLayout {
                             id: dnsCol; width: parent.width; spacing: 0
-                            SettingRow { Layout.fillWidth: true; glyph: win.icoDns; label: "Удалённый DNS"; sub: "Резолвинг через прокси"; control: ValueField { fieldWidth: 220; text: win.dnsRemote; onEdited: win.dnsRemote = value } }
+                            SettingRow { Layout.fillWidth: true; glyph: win.icoDns; label: T.s("set.dnsremote"); sub: T.s("set.dnsremote.sub"); control: ValueField { fieldWidth: 220; text: win.dnsRemote; onEdited: win.dnsRemote = value } }
                             Rectangle { Layout.fillWidth: true; Layout.leftMargin: 50; height: 1; color: Theme.stroke }
-                            SettingRow { Layout.fillWidth: true; glyph: win.icoDns; label: "Прямой DNS"; sub: "Для обходов / локальных доменов"; control: ValueField { fieldWidth: 140; text: win.dnsDirect; onEdited: win.dnsDirect = value } }
+                            SettingRow { Layout.fillWidth: true; glyph: win.icoDns; label: T.s("set.dnsdirect"); sub: T.s("set.dnsdirect.sub"); control: ValueField { fieldWidth: 140; text: win.dnsDirect; onEdited: win.dnsDirect = value } }
                             Rectangle { Layout.fillWidth: true; Layout.leftMargin: 50; height: 1; color: Theme.stroke }
-                            SettingRow { Layout.fillWidth: true; glyph: win.icoShield; label: "Fake-IP"; sub: "Ускоряет резолвинг, меньше утечек"; control: Toggle { checked: win.setFakeIp; onToggled: win.setFakeIp = value } }
+                            SettingRow { Layout.fillWidth: true; glyph: win.icoShield; label: T.s("set.fakeip"); sub: T.s("set.fakeip.sub"); control: Toggle { checked: win.setFakeIp; onToggled: win.setFakeIp = value } }
                         }
                     }
 
                     // === MUX ===
-                    Text { text: "МУЛЬТИПЛЕКСИРОВАНИЕ"; color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1; Layout.topMargin: 8 }
+                    Text { text: T.s("sec.mux"); color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1; Layout.topMargin: 8 }
                     Rectangle {
                         Layout.fillWidth: true; radius: Theme.radius; color: Theme.surface; border.width: 1; border.color: Theme.stroke
                         implicitHeight: muxCol.implicitHeight
                         ColumnLayout {
                             id: muxCol; width: parent.width; spacing: 0
-                            SettingRow { Layout.fillWidth: true; glyph: win.icoMux; label: "Включить Mux"; sub: "Несколько потоков в одном соединении"; control: Toggle { checked: win.setMux; onToggled: win.setMux = value } }
+                            SettingRow { Layout.fillWidth: true; glyph: win.icoMux; label: T.s("set.mux"); sub: T.s("set.mux.sub"); control: Toggle { checked: win.setMux; onToggled: win.setMux = value } }
                             Rectangle { Layout.fillWidth: true; Layout.leftMargin: 50; height: 1; color: Theme.stroke }
-                            SettingRow { Layout.fillWidth: true; glyph: win.icoMux; label: "Протокол"; control: Segmented { width: 210; options: ["smux", "yamux", "h2mux"]; currentIndex: win.muxProto; onSelected: win.muxProto = index } }
+                            SettingRow { Layout.fillWidth: true; glyph: win.icoMux; label: T.s("set.muxproto"); control: Segmented { width: 210; options: ["smux", "yamux", "h2mux"]; currentIndex: win.muxProto; onSelected: win.muxProto = index } }
+                        }
+                    }
+
+                    // === ДИАГНОСТИКА (панель логов скрыта по умолчанию — открывается явно) ===
+                    Text { text: T.s("sec.diagnostics"); color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1; Layout.topMargin: 8 }
+                    Rectangle {
+                        Layout.fillWidth: true; radius: Theme.radius; color: Theme.surface
+                        border.width: 1; border.color: Theme.stroke
+                        implicitHeight: dgCol.implicitHeight
+                        ColumnLayout {
+                            id: dgCol; width: parent.width; spacing: 0
+                            SettingRow {
+                                Layout.fillWidth: true
+                                glyph: win.icoLogs
+                                label: T.s("logs.title")
+                                sub: T.s("logs.sub")
+                                control: Rectangle {
+                                    id: openLogsBtn
+                                    width: 110; height: 32; radius: 9
+                                    color: openLogsHover.hovered ? Theme.hover : "transparent"
+                                    border.width: 1; border.color: Theme.stroke
+                                    Text { anchors.centerIn: parent; text: T.s("btn.open"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 13 }
+                                    HoverHandler { id: openLogsHover; cursorShape: Qt.PointingHandCursor }
+                                    TapHandler { onTapped: win.logsOpen = true }
+                                }
+                            }
                         }
                     }
 
@@ -1196,6 +1492,7 @@ ApplicationWindow {
                 contentHeight: rtCol.implicitHeight
                 clip: true
                 boundsBehavior: Flickable.StopAtBounds
+                ScrollBar.vertical: ThinScrollBar {}
 
                 ColumnLayout {
                     id: rtCol
@@ -1203,12 +1500,83 @@ ApplicationWindow {
                     spacing: 10
 
                     Text {
-                        text: "Маршрутизация"
+                        text: T.s("page.routing")
                         color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 22; font.weight: Font.DemiBold
                         Layout.bottomMargin: 6
                     }
 
-                    Text { text: "ПРОФИЛЬ И ФИНАЛЬНОЕ ДЕЙСТВИЕ"; color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1 }
+                    // ── Профили маршрутизации (именованные пресеты настроек+правил) ──
+                    Text { text: T.s("rt.profiles"); color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1 }
+                    Flow {
+                        Layout.fillWidth: true
+                        spacing: 8
+                        Repeater {
+                            model: win.routingProfiles
+                            delegate: Rectangle {
+                                id: profChip
+                                required property var modelData
+                                required property int index
+                                readonly property bool active: win.currentProfileId === profChip.modelData.id
+                                readonly property bool removable: profChip.modelData.id !== "default"
+                                height: 30
+                                width: profRow.implicitWidth + (profChip.removable ? 36 : 20)
+                                radius: 15
+                                color: profChip.active ? Theme.accent
+                                     : (profHover.hovered ? Qt.lighter(Theme.surface, 1.2) : Theme.surface)
+                                border.width: 1
+                                border.color: profChip.active ? Theme.accent : Theme.stroke
+                                Behavior on color { ColorAnimation { duration: Theme.durFast } }
+
+                                Row {
+                                    id: profRow
+                                    anchors.left: parent.left; anchors.leftMargin: 12
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    spacing: 8
+                                    Text {
+                                        text: profChip.modelData.name
+                                        color: profChip.active ? "white" : Theme.text
+                                        font.family: Theme.fontFamily; font.pixelSize: 12; font.weight: Font.DemiBold
+                                        anchors.verticalCenter: parent.verticalCenter
+                                    }
+                                }
+                                // крестик удаления (только для не-дефолтных)
+                                Text {
+                                    visible: profChip.removable && (profHover.hovered || profChip.active)
+                                    text: "✕"
+                                    color: profChip.active ? Qt.rgba(1,1,1,0.7) : Theme.textMuted
+                                    font.family: Theme.fontFamily; font.pixelSize: 12
+                                    anchors.right: parent.right; anchors.rightMargin: 10
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    HoverHandler { id: profDelHover; cursorShape: Qt.PointingHandCursor }
+                                    TapHandler {
+                                        onTapped: win.askConfirm(T.s("confirm.delprof") + profChip.modelData.name + T.s("confirm.tail"),
+                                                                 function() { win.deleteProfile(profChip.modelData.id) })
+                                    }
+                                }
+                                HoverHandler { id: profHover; cursorShape: Qt.PointingHandCursor }
+                                TapHandler {
+                                    enabled: !profDelHover.hovered
+                                    onTapped: win.applyProfile(profChip.modelData.id)
+                                }
+                            }
+                        }
+                        // "+" — добавить новый профиль
+                        Rectangle {
+                            height: 30; width: 30; radius: 15
+                            color: addProfHover.hovered ? Theme.hover : "transparent"
+                            border.width: 1; border.color: Theme.stroke
+                            Text { anchors.centerIn: parent; text: "+"; color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 16; font.weight: Font.Bold }
+                            HoverHandler { id: addProfHover; cursorShape: Qt.PointingHandCursor }
+                            TapHandler { onTapped: { win.newProfileName = ""; win.newProfileOpen = true } }
+                        }
+                    }
+                    Text {
+                        text: T.s("misc.profile.hint")
+                        color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; wrapMode: Text.Wrap
+                        Layout.fillWidth: true; Layout.bottomMargin: 8
+                    }
+
+                    Text { text: T.s("rt.profilefinal"); color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1 }
                     Rectangle {
                         Layout.fillWidth: true; radius: Theme.radius; color: Theme.surface
                         border.width: 1; border.color: Theme.stroke
@@ -1218,19 +1586,19 @@ ApplicationWindow {
                             width: parent.width; spacing: 0
                             SettingRow {
                                 Layout.fillWidth: true
-                                glyph: win.icoRouting; label: "Профиль маршрута"
-                                control: Segmented { width: 210; options: ["Авто", "Global", "RU"]; currentIndex: win.rtProfile; onSelected: win.rtProfile = index }
+                                glyph: win.icoRouting; label: T.s("set.routeprofile")
+                                control: Segmented { width: 210; options: [T.s("seg.auto"), T.s("seg.global"), T.s("seg.ru")]; currentIndex: win.rtProfile; onSelected: win.rtProfile = index }
                             }
                             Rectangle { Layout.fillWidth: true; Layout.leftMargin: 50; height: 1; color: Theme.stroke }
                             SettingRow {
                                 Layout.fillWidth: true
-                                glyph: win.icoShield; label: "Финальный outbound"; sub: "Куда идёт трафик, не попавший в правила"
-                                control: Segmented { width: 230; options: ["Прокси", "Прямо", "Блок"]; currentIndex: win.rtFinal; onSelected: win.rtFinal = index }
+                                glyph: win.icoShield; label: T.s("set.routefinal"); sub: T.s("set.routefinal.sub")
+                                control: Segmented { width: 230; options: [T.s("seg.proxy"), T.s("seg.direct"), T.s("seg.block")]; currentIndex: win.rtFinal; onSelected: win.rtFinal = index }
                             }
                         }
                     }
 
-                    Text { text: "ПРЕСЕТЫ"; color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1; Layout.topMargin: 8 }
+                    Text { text: T.s("rt.presets"); color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1; Layout.topMargin: 8 }
                     Rectangle {
                         Layout.fillWidth: true; radius: Theme.radius; color: Theme.surface
                         border.width: 1; border.color: Theme.stroke
@@ -1238,21 +1606,34 @@ ApplicationWindow {
                         ColumnLayout {
                             id: rtPreCol
                             width: parent.width; spacing: 0
-                            SettingRow { Layout.fillWidth: true; glyph: win.icoLink; label: "Обход локальной сети"; sub: "LAN и приватные подсети — напрямую"; control: Toggle { checked: win.rtLan; onToggled: win.rtLan = value } }
+                            SettingRow { Layout.fillWidth: true; glyph: win.icoLink; label: T.s("set.routelan"); sub: T.s("set.routelan.sub"); control: Toggle { checked: win.rtLan; onToggled: win.rtLan = value } }
                             Rectangle { Layout.fillWidth: true; Layout.leftMargin: 50; height: 1; color: Theme.stroke }
-                            SettingRow { Layout.fillWidth: true; glyph: win.icoRouting; label: "Прямой доступ к RU-сайтам"; sub: "geosite:ru / geoip:ru мимо прокси"; control: Toggle { checked: win.rtRegionDirect; onToggled: win.rtRegionDirect = value } }
+                            SettingRow { Layout.fillWidth: true; glyph: win.icoRouting; label: T.s("set.routeru"); sub: T.s("set.routeru.sub"); control: Toggle { checked: win.rtRegionDirect; onToggled: win.rtRegionDirect = value } }
                             Rectangle { Layout.fillWidth: true; Layout.leftMargin: 50; height: 1; color: Theme.stroke }
-                            SettingRow { Layout.fillWidth: true; glyph: win.icoShield; label: "Блокировка рекламы"; sub: "Резать рекламные и трекерные домены"; control: Toggle { checked: win.rtAdblock; onToggled: win.rtAdblock = value } }
+                            SettingRow { Layout.fillWidth: true; glyph: win.icoShield; label: T.s("set.adblock"); sub: T.s("set.adblock.sub"); control: Toggle { checked: win.rtAdblock; onToggled: win.rtAdblock = value } }
                             Rectangle { Layout.fillWidth: true; Layout.leftMargin: 50; height: 1; color: Theme.stroke }
-                            SettingRow { Layout.fillWidth: true; glyph: win.icoLock; label: "Проксировать всё"; sub: "Игнорировать обходы (кроме LAN)"; control: Toggle { checked: win.rtProxyAll; onToggled: win.rtProxyAll = value } }
+                            SettingRow { Layout.fillWidth: true; glyph: win.icoLock; label: T.s("set.proxyall"); sub: T.s("set.proxyall.sub"); control: Toggle { checked: win.rtProxyAll; onToggled: win.rtProxyAll = value } }
                         }
                     }
 
                     RowLayout {
                         Layout.fillWidth: true
                         Layout.topMargin: 8
-                        Text { text: "ПРАВИЛА"; color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1 }
+                        Text { text: T.s("rt.rules"); color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1 }
                         Item { Layout.fillWidth: true }
+                        // импорт правил из чужих клиентов
+                        Rectangle {
+                            width: importRow.implicitWidth + 22; height: 28; radius: 14
+                            color: importRulesHover.hovered ? Theme.hover : "transparent"
+                            border.width: 1; border.color: Theme.stroke
+                            Row {
+                                id: importRow; anchors.centerIn: parent; spacing: 6
+                                Text { text: String.fromCharCode(0xE8B5); font.family: Theme.iconFamily; font.pixelSize: 13; color: Theme.textSub; anchors.verticalCenter: parent.verticalCenter }
+                                Text { text: T.s("btn.importrules"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 12; font.weight: Font.Medium; anchors.verticalCenter: parent.verticalCenter }
+                            }
+                            HoverHandler { id: importRulesHover; cursorShape: Qt.PointingHandCursor }
+                            TapHandler { onTapped: { win.importDraft = ""; win.importRulesOpen = true } }
+                        }
                         Rectangle {
                             width: addRow.implicitWidth + 24; height: 28; radius: 14
                             color: addHover.hovered ? Qt.lighter(Theme.accent, 1.1) : Theme.accent
@@ -1262,7 +1643,7 @@ ApplicationWindow {
                                 anchors.centerIn: parent
                                 spacing: 6
                                 Text { text: "+"; color: "white"; font.family: Theme.fontFamily; font.pixelSize: 16; font.weight: Font.Bold; anchors.verticalCenter: parent.verticalCenter }
-                                Text { text: "Правило"; color: "white"; font.family: Theme.fontFamily; font.pixelSize: 12; font.weight: Font.DemiBold; anchors.verticalCenter: parent.verticalCenter }
+                                Text { text: T.s("btn.rule"); color: "white"; font.family: Theme.fontFamily; font.pixelSize: 12; font.weight: Font.DemiBold; anchors.verticalCenter: parent.verticalCenter }
                             }
                             HoverHandler { id: addHover; cursorShape: Qt.PointingHandCursor }
                             TapHandler { onTapped: win.openRuleEditor() }
@@ -1283,12 +1664,17 @@ ApplicationWindow {
                                 required property int index
                                 required property var modelData
                                 width: rulesList.width
-                                height: 52
+                                // process-правила управляются секцией «ПРИЛОЖЕНИЯ» ниже — не показываем дубликат
+                                // в общем списке. height:0 + visible:false: ListView их пропускает по высоте,
+                                // но индексы остаются исходными → drag-sort/remove работают без мапинга.
+                                readonly property bool _hidden: rwrap.modelData.type === "process"
+                                visible: !rwrap._hidden
+                                height: rwrap._hidden ? 0 : 52
                                 z: dragMa.drag.active ? 2 : 1
                                 readonly property color actColor: modelData.action === "proxy" ? Theme.accent
                                     : modelData.action === "direct" ? Theme.green : Theme.red
-                                readonly property string actText: modelData.action === "proxy" ? "Прокси"
-                                    : modelData.action === "direct" ? "Прямо" : "Блок"
+                                readonly property string actText: modelData.action === "proxy" ? T.s("seg.proxy")
+                                    : modelData.action === "direct" ? T.s("seg.direct") : T.s("seg.block")
 
                                 Rectangle {
                                     id: rcontent
@@ -1368,6 +1754,177 @@ ApplicationWindow {
                         }
                     }
 
+                    // === ПРИЛОЖЕНИЯ — per-app проксирование (тумблеры) ===
+                    RowLayout {
+                        Layout.fillWidth: true; Layout.topMargin: 14
+                        Text { text: T.s("rt.apps"); color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1 }
+                        Item { Layout.fillWidth: true }
+                        // мини-кнопка «Сбросить per-app правила» — видна только если есть что сбрасывать
+                        Rectangle {
+                            visible: win.routeRules.filter(function(r) { return r.type === "process" }).length > 0
+                            width: 110; height: 28; radius: 8
+                            color: resetAppsHover.hovered ? Theme.hover : "transparent"
+                            border.width: 1; border.color: Theme.stroke
+                            Text { anchors.centerIn: parent; text: T.s("btn.reset"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 12 }
+                            HoverHandler { id: resetAppsHover; cursorShape: Qt.PointingHandCursor }
+                            TapHandler { onTapped: win.askConfirm(T.s("confirm.delperapp"), function() { win.resetAppRules() }) }
+                        }
+                        Rectangle {
+                            // кнопка «+ Добавить» — открывает системный файл-пикер для exe
+                            width: 105; height: 28; radius: 8
+                            color: addAppHover.hovered ? Theme.hover : "transparent"
+                            border.width: 1; border.color: Theme.stroke
+                            Row { anchors.centerIn: parent; spacing: 5
+                                Text { text: "+"; color: Theme.accent; font.family: Theme.fontFamily; font.pixelSize: 14; font.weight: Font.Bold; anchors.verticalCenter: parent.verticalCenter }
+                                Text { text: T.s("btn.add"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 12; anchors.verticalCenter: parent.verticalCenter }
+                            }
+                            HoverHandler { id: addAppHover; cursorShape: Qt.PointingHandCursor }
+                            TapHandler { onTapped: backend.addCustomAppDialog() }
+                        }
+                        Rectangle {
+                            // мини-кнопка «Пересканировать»
+                            width: 130; height: 28; radius: 8
+                            color: rescanHover.hovered ? Theme.hover : "transparent"
+                            border.width: 1; border.color: Theme.stroke
+                            Text { anchors.centerIn: parent; text: T.s("btn.rescan"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 12 }
+                            HoverHandler { id: rescanHover; cursorShape: Qt.PointingHandCursor }
+                            TapHandler { onTapped: backend.scanApps() }
+                        }
+                    }
+                    Text {
+                        text: {
+                            var finalT = win.rtFinal === 1 ? T.s("seg.direct") : win.rtFinal === 2 ? T.s("seg.block") : T.s("seg.proxy")
+                            var p = win._findProfile(win.currentProfileId)
+                            return T.s("apps.activeprofile") + (p ? p.name : "—") + T.s("apps.defaultis") + finalT + "). "
+                                + T.s("apps.action.hint")
+                        }
+                        color: Theme.textSub; font.family: Theme.fontFamily; font.pixelSize: 11; wrapMode: Text.Wrap
+                        Layout.fillWidth: true
+                    }
+
+                    // поле поиска
+                    ValueField {
+                        Layout.fillWidth: true
+                        align: TextInput.AlignLeft
+                        text: win.appFilter
+                        placeholder: T.s("apps.search")
+                        onEdited: win.appFilter = value
+                    }
+
+                    // список приложений
+                    Rectangle {
+                        Layout.fillWidth: true; radius: Theme.radius; color: Theme.surface
+                        border.width: 1; border.color: Theme.stroke
+                        implicitHeight: appsCol.implicitHeight > 0 ? appsCol.implicitHeight + 8 : 56
+                        ColumnLayout {
+                            id: appsCol
+                            width: parent.width; spacing: 0
+
+                            // пустое состояние (на момент сканирования)
+                            Text {
+                                visible: (backend.appList || []).length === 0
+                                Layout.fillWidth: true
+                                Layout.margins: 14
+                                text: T.s("apps.scanning")
+                                color: Theme.textSub; font.family: Theme.fontFamily; font.pixelSize: 13
+                            }
+                            Text {
+                                visible: (backend.appList || []).length > 0 && win.appsFiltered().length === 0
+                                Layout.fillWidth: true
+                                Layout.margins: 14
+                                text: T.s("apps.notfound") + win.appFilter + "»"
+                                color: Theme.textSub; font.family: Theme.fontFamily; font.pixelSize: 13
+                            }
+
+                            Repeater {
+                                model: win.appsFiltered()
+                                delegate: Item {
+                                    id: appRow
+                                    required property var modelData
+                                    required property int index
+                                    width: appsCol.width
+                                    height: 44
+
+                                    Rectangle {
+                                        anchors.fill: parent
+                                        color: appHover.hovered ? Theme.hover : "transparent"
+                                        HoverHandler { id: appHover }
+                                    }
+                                    Rectangle {
+                                        visible: appRow.index < win.appsFiltered().length - 1
+                                        anchors.bottom: parent.bottom; anchors.left: parent.left; anchors.right: parent.right
+                                        anchors.leftMargin: 50
+                                        height: 1; color: Theme.stroke
+                                    }
+
+                                    RowLayout {
+                                        anchors.fill: parent
+                                        anchors.leftMargin: 14; anchors.rightMargin: 14
+                                        spacing: 12
+                                        Image {
+                                            width: 22; height: 22
+                                            sourceSize.width: 44; sourceSize.height: 44
+                                            source: appRow.modelData.icon
+                                            fillMode: Image.PreserveAspectFit
+                                            smooth: true
+                                            Layout.alignment: Qt.AlignVCenter
+                                            // фоллбэк если иконки нет
+                                            Rectangle { anchors.fill: parent; visible: parent.status !== Image.Ready; color: Theme.surfaceAlt; radius: 4 }
+                                        }
+                                        ColumnLayout {
+                                            Layout.fillWidth: true; spacing: 1
+                                            Text {
+                                                text: appRow.modelData.name
+                                                color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 13
+                                                elide: Text.ElideRight; Layout.fillWidth: true
+                                            }
+                                            Text {
+                                                text: appRow.modelData.exeName
+                                                color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 10
+                                                elide: Text.ElideRight; Layout.fillWidth: true
+                                            }
+                                        }
+                                        Segmented {
+                                            id: appSeg
+                                            width: 188
+                                            options: [T.s("seg.auto"), T.s("seg.vpn"), T.s("seg.direct")]
+                                            Layout.alignment: Qt.AlignVCenter
+                                            onSelected: win.setAppRouteState(
+                                                appRow.modelData.exeName,
+                                                index === 1 ? "proxy" : index === 2 ? "direct" : "auto")
+                                            // Segmented сам ставит currentIndex императивно при тапе (ломает inline-биндинг).
+                                            // Binding-элемент пере-устанавливает значение при ЛЮБОМ изменении routeRules
+                                            // (включая правки из глобальной таблицы правил или Сброс).
+                                            Binding on currentIndex {
+                                                value: {
+                                                    var s = win.appRouteState(appRow.modelData.exeName)
+                                                    return s === "proxy" ? 1 : s === "direct" ? 2 : 0
+                                                }
+                                            }
+                                        }
+                                        // крестик удаления — только для пользовательских (вручную добавленных)
+                                        Text {
+                                            visible: !!appRow.modelData.custom
+                                            text: "✕"
+                                            color: rmCustomHover.hovered ? Theme.red : Theme.textMuted
+                                            font.family: Theme.fontFamily; font.pixelSize: 13
+                                            Layout.alignment: Qt.AlignVCenter
+                                            Behavior on color { ColorAnimation { duration: Theme.durFast } }
+                                            HoverHandler { id: rmCustomHover; cursorShape: Qt.PointingHandCursor }
+                                            TapHandler {
+                                                onTapped: {
+                                                    // снимаем правило, чтобы не оставить «висящее» process-правило
+                                                    win.setAppRouteState(appRow.modelData.exeName, "auto")
+                                                    backend.removeCustomApp(appRow.modelData.exeName)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     Item { Layout.preferredHeight: 8 }
                 }
             }
@@ -1425,6 +1982,7 @@ ApplicationWindow {
                         clip: true
                         spacing: 4
                         boundsBehavior: Flickable.StopAtBounds
+                        ScrollBar.vertical: ThinScrollBar {}
                         model: backend.servers
                         delegate: ServerCard {
                             required property var modelData
@@ -1472,21 +2030,21 @@ ApplicationWindow {
                     x: 6; y: 6
                     spacing: 1
 
-                    CtxItem { glyph: String.fromCharCode(0xE7E8); label: "Подключиться"; onClicked: { backend.selectServer(win.ctxName()); if (backend.status === "disconnected") backend.toggle(); win.ctxOpen = false } }
-                    CtxItem { glyph: String.fromCharCode(0xE70F); label: "Изменить"; onClicked: { win.openServerEditor(win.ctxIndex); win.ctxOpen = false } }
-                    CtxItem { glyph: String.fromCharCode(0xE8C8); label: "Дублировать"; onClicked: { backend.duplicateServer(win.ctxIndex); win.ctxOpen = false } }
-                    CtxItem { glyph: String.fromCharCode(0xE72D); label: "Поделиться"; onClicked: { win.openShare(win.ctxIndex); win.ctxOpen = false } }
-                    CtxItem { glyph: String.fromCharCode(0xE71B); label: "Копировать ссылку"; onClicked: { backend.copyToClipboard(backend.serverLink(win.ctxIndex)); win.ctxOpen = false } }
+                    CtxItem { glyph: String.fromCharCode(0xE7E8); label: T.s("ctx.connect"); onClicked: { backend.selectServer(win.ctxName()); if (backend.status === "disconnected") backend.toggle(); win.ctxOpen = false } }
+                    CtxItem { glyph: String.fromCharCode(0xE70F); label: T.s("ctx.edit"); onClicked: { win.openServerEditor(win.ctxIndex); win.ctxOpen = false } }
+                    CtxItem { glyph: String.fromCharCode(0xE8C8); label: T.s("ctx.duplicate"); onClicked: { backend.duplicateServer(win.ctxIndex); win.ctxOpen = false } }
+                    CtxItem { glyph: String.fromCharCode(0xE72D); label: T.s("ctx.share"); onClicked: { win.openShare(win.ctxIndex); win.ctxOpen = false } }
+                    CtxItem { glyph: String.fromCharCode(0xE71B); label: T.s("ctx.copylink"); onClicked: { backend.copyToClipboard(backend.serverLink(win.ctxIndex)); win.ctxOpen = false } }
                     CtxItem {
                         readonly property bool isFav: backend.servers[win.ctxIndex] ? backend.servers[win.ctxIndex].fav === true : false
                         glyph: String.fromCharCode(isFav ? 0xE735 : 0xE734)
-                        label: isFav ? "Убрать из избранного" : "В избранное"
+                        label: isFav ? T.s("loc.fav.remove") : T.s("loc.fav.add")
                         onClicked: { backend.toggleFavorite(win.ctxIndex); win.ctxOpen = false }
                     }
                     Rectangle { Layout.fillWidth: true; Layout.leftMargin: 10; Layout.rightMargin: 10; Layout.topMargin: 4; Layout.bottomMargin: 4; height: 1; color: Theme.stroke }
-                    CtxItem { glyph: String.fromCharCode(0xE74D); label: "Удалить"; danger: true; onClicked: { var n = win.ctxName(); var i = win.ctxIndex; win.ctxOpen = false; win.askConfirm("Удалить сервер «" + n + "»?", function() { backend.removeServer(i) }) } }
+                    CtxItem { glyph: String.fromCharCode(0xE74D); label: T.s("ctx.delete"); danger: true; onClicked: { var n = win.ctxName(); var i = win.ctxIndex; win.ctxOpen = false; win.askConfirm(T.s("confirm.delsrv") + n + T.s("confirm.tail"), function() { backend.removeServer(i) }) } }
                     Rectangle { Layout.fillWidth: true; Layout.leftMargin: 10; Layout.rightMargin: 10; Layout.topMargin: 4; Layout.bottomMargin: 4; height: 1; color: Theme.stroke }
-                    CtxItem { glyph: String.fromCharCode(0xE710); label: "Добавить сервер"; onClicked: { win.openServerEditor(-1); win.ctxOpen = false } }
+                    CtxItem { glyph: String.fromCharCode(0xE710); label: T.s("ctx.connect"); onClicked: { win.openServerEditor(-1); win.ctxOpen = false } }
                 }
             }
 
@@ -1520,17 +2078,17 @@ ApplicationWindow {
                     x: 18; y: 18
                     spacing: 10
 
-                    Text { text: "Новая подписка"; color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 17; font.weight: Font.DemiBold }
+                    Text { text: T.s("modal.sub.title"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 17; font.weight: Font.DemiBold }
 
-                    Text { text: "НАЗВАНИЕ"; color: Theme.textMuted; font.pixelSize: 10; font.weight: Font.DemiBold; font.letterSpacing: 1; font.family: Theme.fontFamily; Layout.topMargin: 2 }
-                    ValueField { Layout.fillWidth: true; align: TextInput.AlignLeft; text: win.draftSubName; placeholder: "напр. My VPN"; onEdited: win.draftSubName = value }
+                    Text { text: T.s("modal.sub.name"); color: Theme.textMuted; font.pixelSize: 10; font.weight: Font.DemiBold; font.letterSpacing: 1; font.family: Theme.fontFamily; Layout.topMargin: 2 }
+                    ValueField { Layout.fillWidth: true; align: TextInput.AlignLeft; text: win.draftSubName; placeholder: T.s("modal.sub.nameph"); onEdited: win.draftSubName = value }
 
-                    Text { text: "ССЫЛКА ПОДПИСКИ"; color: Theme.textMuted; font.pixelSize: 10; font.weight: Font.DemiBold; font.letterSpacing: 1; font.family: Theme.fontFamily; Layout.topMargin: 2 }
-                    ValueField { Layout.fillWidth: true; align: TextInput.AlignLeft; text: win.draftSubUrl; placeholder: "https://…  или  vless:// / vmess://"; onEdited: win.draftSubUrl = value }
+                    Text { text: T.s("modal.sub.url"); color: Theme.textMuted; font.pixelSize: 10; font.weight: Font.DemiBold; font.letterSpacing: 1; font.family: Theme.fontFamily; Layout.topMargin: 2 }
+                    ValueField { Layout.fillWidth: true; align: TextInput.AlignLeft; text: win.draftSubUrl; placeholder: T.s("modal.sub.urlph"); onEdited: win.draftSubUrl = value }
 
                     RowLayout {
                         Layout.fillWidth: true; Layout.topMargin: 4
-                        Text { text: "Авто-обновление"; color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 13 }
+                        Text { text: T.s("set.autoupdate"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 13 }
                         Item { Layout.fillWidth: true }
                         Toggle { checked: win.draftSubAuto; onToggled: win.draftSubAuto = value }
                     }
@@ -1542,7 +2100,7 @@ ApplicationWindow {
                             width: 96; height: 36; radius: 10
                             color: cancelSubHover.hovered ? Theme.hover : "transparent"
                             border.width: 1; border.color: Theme.stroke
-                            Text { anchors.centerIn: parent; text: "Отмена"; color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 13 }
+                            Text { anchors.centerIn: parent; text: T.s("btn.cancel"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 13 }
                             HoverHandler { id: cancelSubHover; cursorShape: Qt.PointingHandCursor }
                             TapHandler { onTapped: win.addSubOpen = false }
                         }
@@ -1551,7 +2109,7 @@ ApplicationWindow {
                             readonly property bool ready: win.draftSubUrl.length > 0
                             color: !ready ? Theme.surfaceAlt : (addSubHover2.hovered ? Qt.lighter(Theme.accent, 1.1) : Theme.accent)
                             Behavior on color { ColorAnimation { duration: Theme.durFast } }
-                            Text { anchors.centerIn: parent; text: "Добавить"; color: parent.ready ? "white" : Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 13; font.weight: Font.DemiBold }
+                            Text { anchors.centerIn: parent; text: T.s("btn.add"); color: parent.ready ? "white" : Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 13; font.weight: Font.DemiBold }
                             HoverHandler { id: addSubHover2; cursorShape: Qt.PointingHandCursor }
                             TapHandler { onTapped: win.addSub() }
                         }
@@ -1597,7 +2155,7 @@ ApplicationWindow {
 
                     RowLayout {
                         Layout.fillWidth: true
-                        Text { text: win.epIndex < 0 ? "Новый сервер" : "Сервер"; color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 17; font.weight: Font.DemiBold }
+                        Text { text: win.epIndex < 0 ? T.s("misc.newsrv") : T.s("modal.srv.title"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 17; font.weight: Font.DemiBold }
                         Item { Layout.fillWidth: true }
                         Text {
                             visible: win.epIndex >= 0
@@ -1606,7 +2164,7 @@ ApplicationWindow {
                             color: delSrvHover.hovered ? Theme.red : Theme.textMuted
                             Behavior on color { ColorAnimation { duration: Theme.durFast } }
                             HoverHandler { id: delSrvHover; cursorShape: Qt.PointingHandCursor }
-                            TapHandler { onTapped: win.askConfirm("Удалить сервер «" + win.epName + "»?", function() { backend.removeServer(win.epIndex); win.serverEditorOpen = false }) }
+                            TapHandler { onTapped: win.askConfirm(T.s("confirm.delsrv") + win.epName + T.s("confirm.tail"), function() { backend.removeServer(win.epIndex); win.serverEditorOpen = false }) }
                         }
                     }
 
@@ -1618,19 +2176,20 @@ ApplicationWindow {
                         contentHeight: seFields.implicitHeight
                         clip: true
                         boundsBehavior: Flickable.StopAtBounds
+                        ScrollBar.vertical: ThinScrollBar {}
 
                         ColumnLayout {
                             id: seFields
                             width: seFlick.width
                             spacing: 10
 
-                            FLabel { text: "ИМЯ / МЕТКА" }
-                            ValueField { Layout.fillWidth: true; align: TextInput.AlignLeft; text: win.epName; placeholder: "напр. Netherlands #1"; onEdited: win.epName = value }
+                            FLabel { text: T.s("modal.srv.name") }
+                            ValueField { Layout.fillWidth: true; align: TextInput.AlignLeft; text: win.epName; placeholder: T.s("modal.srv.nameph"); onEdited: win.epName = value }
 
-                            FLabel { text: "ПРОТОКОЛ" }
+                            FLabel { text: T.s("modal.srv.proto") }
                             ChipRow { Layout.fillWidth: true; options: win.protoList; current: win.epProtocol; onPicked: win.epProtocol = value }
 
-                            FLabel { text: "АДРЕС И ПОРТ" }
+                            FLabel { text: T.s("modal.srv.addrport") }
                             RowLayout {
                                 Layout.fillWidth: true; spacing: 8
                                 ValueField { Layout.fillWidth: true; align: TextInput.AlignLeft; text: win.epAddress; placeholder: "example.com"; onEdited: win.epAddress = value }
@@ -1638,18 +2197,39 @@ ApplicationWindow {
                             }
 
                             FLabel { visible: serverEditor.pV || serverEditor.pVm; text: "UUID" }
-                            ValueField { visible: serverEditor.pV || serverEditor.pVm; Layout.fillWidth: true; align: TextInput.AlignLeft; text: win.epUuid; placeholder: "xxxxxxxx-xxxx-xxxx-…"; onEdited: win.epUuid = value }
+                            ValueField { visible: serverEditor.pV || serverEditor.pVm; Layout.fillWidth: true; align: TextInput.AlignLeft; text: win.epUuid; placeholder: T.s("modal.srv.uuidph"); onEdited: win.epUuid = value }
 
-                            FLabel { visible: serverEditor.pT || serverEditor.pSs; text: "ПАРОЛЬ" }
-                            ValueField { visible: serverEditor.pT || serverEditor.pSs; Layout.fillWidth: true; align: TextInput.AlignLeft; text: win.epPassword; placeholder: "пароль"; onEdited: win.epPassword = value }
+                            FLabel { visible: serverEditor.pT || serverEditor.pSs; text: T.s("modal.srv.password") }
+                            ValueField { visible: serverEditor.pT || serverEditor.pSs; Layout.fillWidth: true; align: TextInput.AlignLeft; text: win.epPassword; placeholder: T.s("modal.srv.passwordph"); onEdited: win.epPassword = value }
 
-                            FLabel { visible: serverEditor.pSs; text: "МЕТОД ШИФРОВАНИЯ" }
+                            FLabel { visible: serverEditor.pSs; text: T.s("modal.srv.method") }
                             ChipRow { visible: serverEditor.pSs; Layout.fillWidth: true; options: win.ssMethods; current: win.epMethod; onPicked: win.epMethod = value }
 
-                            FLabel { visible: serverEditor.pWg; text: "ПРИВАТНЫЙ КЛЮЧ" }
+                            FLabel { visible: serverEditor.pWg; text: T.s("modal.srv.wgkey") }
                             ValueField { visible: serverEditor.pWg; Layout.fillWidth: true; align: TextInput.AlignLeft; text: win.epWgKey; placeholder: "base64 private key"; onEdited: win.epWgKey = value }
 
-                            FLabel { visible: serverEditor.tlsCap; text: "БЕЗОПАСНОСТЬ" }
+                            FLabel { visible: serverEditor.pWg; text: "PEER PUBLIC KEY" }
+                            ValueField { visible: serverEditor.pWg; Layout.fillWidth: true; align: TextInput.AlignLeft; text: win.epPeerKey; placeholder: "base64 peer public key"; onEdited: win.epPeerKey = value }
+
+                            FLabel { visible: serverEditor.pWg; text: "LOCAL ADDRESS" }
+                            ValueField { visible: serverEditor.pWg; Layout.fillWidth: true; align: TextInput.AlignLeft; text: win.epLocalAddr; placeholder: "172.16.0.2/32"; onEdited: win.epLocalAddr = value }
+
+                            FLabel { visible: serverEditor.pWg; text: "ALLOWED IPs" }
+                            ValueField { visible: serverEditor.pWg; Layout.fillWidth: true; align: TextInput.AlignLeft; text: win.epAllowedIps; placeholder: "0.0.0.0/0"; onEdited: win.epAllowedIps = value }
+
+                            RowLayout {
+                                visible: serverEditor.pWg; Layout.fillWidth: true; spacing: 12
+                                ColumnLayout { spacing: 4
+                                    FLabel { text: "MTU" }
+                                    ValueField { fieldWidth: 90; numeric: true; text: win.epWgMtu; placeholder: "1420"; onEdited: win.epWgMtu = value }
+                                }
+                                ColumnLayout { Layout.fillWidth: true; spacing: 4
+                                    FLabel { text: T.s("modal.srv.psk") }
+                                    ValueField { Layout.fillWidth: true; align: TextInput.AlignLeft; text: win.epPsk; placeholder: T.s("modal.srv.pskph"); onEdited: win.epPsk = value }
+                                }
+                            }
+
+                            FLabel { visible: serverEditor.tlsCap; text: T.s("sec.security") }
                             RowLayout {
                                 visible: serverEditor.tlsCap; Layout.fillWidth: true
                                 Text { text: "TLS"; color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 14; Layout.alignment: Qt.AlignVCenter }
@@ -1672,7 +2252,7 @@ ApplicationWindow {
                             FLabel { visible: serverEditor.pV; text: "FLOW" }
                             ChipRow { visible: serverEditor.pV; Layout.fillWidth: true; options: ["none", "xtls-rprx-vision"]; current: win.epFlow.length ? win.epFlow : "none"; onPicked: win.epFlow = (value === "none" ? "" : value) }
 
-                            FLabel { visible: serverEditor.tlsCap; text: "ТРАНСПОРТ" }
+                            FLabel { visible: serverEditor.tlsCap; text: T.s("modal.srv.transport") }
                             ChipRow { visible: serverEditor.tlsCap; Layout.fillWidth: true; options: win.transports; current: win.epTransport; onPicked: win.epTransport = value }
                             FLabel { visible: serverEditor.tlsCap && (win.epTransport === "ws" || win.epTransport === "xhttp"); text: "PATH" }
                             ValueField { visible: serverEditor.tlsCap && (win.epTransport === "ws" || win.epTransport === "xhttp"); Layout.fillWidth: true; align: TextInput.AlignLeft; text: win.epPath; placeholder: "/path"; onEdited: win.epPath = value }
@@ -1695,7 +2275,7 @@ ApplicationWindow {
                             Row {
                                 id: shareBtnRow; anchors.centerIn: parent; spacing: 6
                                 Text { text: String.fromCharCode(0xE72D); font.family: Theme.iconFamily; font.pixelSize: 14; color: Theme.text; anchors.verticalCenter: parent.verticalCenter }
-                                Text { text: "Поделиться"; color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 13; anchors.verticalCenter: parent.verticalCenter }
+                                Text { text: T.s("btn.share"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 13; anchors.verticalCenter: parent.verticalCenter }
                             }
                             HoverHandler { id: shareBtnHover; cursorShape: Qt.PointingHandCursor }
                             TapHandler { onTapped: win.openShare(win.epIndex) }
@@ -1705,7 +2285,7 @@ ApplicationWindow {
                             width: 96; height: 38; radius: 10
                             color: cancelSrvHover.hovered ? Theme.hover : "transparent"
                             border.width: 1; border.color: Theme.stroke
-                            Text { anchors.centerIn: parent; text: "Отмена"; color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 13 }
+                            Text { anchors.centerIn: parent; text: T.s("btn.cancel"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 13 }
                             HoverHandler { id: cancelSrvHover; cursorShape: Qt.PointingHandCursor }
                             TapHandler { onTapped: win.serverEditorOpen = false }
                         }
@@ -1715,7 +2295,7 @@ ApplicationWindow {
                             readonly property bool ready: win.epAddress.length > 0
                             color: !ready ? Theme.surfaceAlt : (saveSrvHover.hovered ? Qt.lighter(Theme.accent, 1.1) : Theme.accent)
                             Behavior on color { ColorAnimation { duration: Theme.durFast } }
-                            Text { anchors.centerIn: parent; text: win.epIndex < 0 ? "Добавить" : "Сохранить"; color: parent.ready ? "white" : Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 13; font.weight: Font.DemiBold }
+                            Text { anchors.centerIn: parent; text: win.epIndex < 0 ? T.s("misc.addbtn") : T.s("misc.savebtn"); color: parent.ready ? "white" : Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 13; font.weight: Font.DemiBold }
                             HoverHandler { id: saveSrvHover; cursorShape: Qt.PointingHandCursor }
                             TapHandler { onTapped: win.saveServer() }
                         }
@@ -1753,7 +2333,7 @@ ApplicationWindow {
                     x: 18; y: 18
                     spacing: 14
 
-                    Text { text: "Поделиться сервером"; color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 17; font.weight: Font.DemiBold; Layout.alignment: Qt.AlignHCenter }
+                    Text { text: T.s("modal.share.title"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 17; font.weight: Font.DemiBold; Layout.alignment: Qt.AlignHCenter }
 
                     Rectangle {
                         Layout.alignment: Qt.AlignHCenter
@@ -1766,7 +2346,7 @@ ApplicationWindow {
                             smooth: false
                             visible: win.shareQr.length > 0
                         }
-                        Text { anchors.centerIn: parent; visible: win.shareQr.length === 0; text: "QR недоступен"; color: "#999999"; font.family: Theme.fontFamily; font.pixelSize: 12 }
+                        Text { anchors.centerIn: parent; visible: win.shareQr.length === 0; text: T.s("modal.share.noqr"); color: "#999999"; font.family: Theme.fontFamily; font.pixelSize: 12 }
                     }
 
                     Rectangle {
@@ -1790,7 +2370,7 @@ ApplicationWindow {
                             height: 38; radius: 10
                             color: copyHover.hovered ? Qt.lighter(Theme.accent, 1.1) : Theme.accent
                             Behavior on color { ColorAnimation { duration: Theme.durFast } }
-                            Text { anchors.centerIn: parent; text: "Копировать ссылку"; color: "white"; font.family: Theme.fontFamily; font.pixelSize: 13; font.weight: Font.DemiBold }
+                            Text { anchors.centerIn: parent; text: T.s("btn.copylink"); color: "white"; font.family: Theme.fontFamily; font.pixelSize: 13; font.weight: Font.DemiBold }
                             HoverHandler { id: copyHover; cursorShape: Qt.PointingHandCursor }
                             TapHandler { onTapped: backend.copyToClipboard(win.shareLink) }
                         }
@@ -1799,7 +2379,7 @@ ApplicationWindow {
                             width: 96; height: 38; radius: 10
                             color: closeShHover.hovered ? Theme.hover : "transparent"
                             border.width: 1; border.color: Theme.stroke
-                            Text { anchors.centerIn: parent; text: "Закрыть"; color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 13 }
+                            Text { anchors.centerIn: parent; text: T.s("btn.close"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 13 }
                             HoverHandler { id: closeShHover; cursorShape: Qt.PointingHandCursor }
                             TapHandler { onTapped: win.shareOpen = false }
                         }
@@ -1860,7 +2440,7 @@ ApplicationWindow {
                             width: 100; height: 38; radius: 10
                             color: cfCancelHover.hovered ? Theme.hover : "transparent"
                             border.width: 1; border.color: Theme.stroke
-                            Text { anchors.centerIn: parent; text: "Отмена"; color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 13 }
+                            Text { anchors.centerIn: parent; text: T.s("btn.cancel"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 13 }
                             HoverHandler { id: cfCancelHover; cursorShape: Qt.PointingHandCursor }
                             TapHandler { onTapped: win.confirmOpen = false }
                         }
@@ -1869,7 +2449,7 @@ ApplicationWindow {
                             width: 110; height: 38; radius: 10
                             color: cfDelHover.hovered ? Qt.lighter(Theme.red, 1.1) : Theme.red
                             Behavior on color { ColorAnimation { duration: Theme.durFast } }
-                            Text { anchors.centerIn: parent; text: "Удалить"; color: "white"; font.family: Theme.fontFamily; font.pixelSize: 13; font.weight: Font.DemiBold }
+                            Text { anchors.centerIn: parent; text: T.s("btn.delete"); color: "white"; font.family: Theme.fontFamily; font.pixelSize: 13; font.weight: Font.DemiBold }
                             HoverHandler { id: cfDelHover; cursorShape: Qt.PointingHandCursor }
                             TapHandler { onTapped: win.doConfirm() }
                         }
@@ -1907,9 +2487,9 @@ ApplicationWindow {
                     x: 18; y: 18
                     spacing: 12
 
-                    Text { text: "Новое правило"; color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 17; font.weight: Font.DemiBold }
+                    Text { text: T.s("modal.rule.title"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 17; font.weight: Font.DemiBold }
 
-                    Text { text: "ТИП"; color: Theme.textMuted; font.pixelSize: 10; font.weight: Font.DemiBold; font.letterSpacing: 1; font.family: Theme.fontFamily; Layout.topMargin: 2 }
+                    Text { text: T.s("modal.rule.type"); color: Theme.textMuted; font.pixelSize: 10; font.weight: Font.DemiBold; font.letterSpacing: 1; font.family: Theme.fontFamily; Layout.topMargin: 2 }
                     Flow {
                         Layout.fillWidth: true
                         spacing: 8
@@ -1929,18 +2509,18 @@ ApplicationWindow {
                         }
                     }
 
-                    Text { text: "ЗНАЧЕНИЕ"; color: Theme.textMuted; font.pixelSize: 10; font.weight: Font.DemiBold; font.letterSpacing: 1; font.family: Theme.fontFamily; Layout.topMargin: 2 }
+                    Text { text: T.s("modal.rule.value"); color: Theme.textMuted; font.pixelSize: 10; font.weight: Font.DemiBold; font.letterSpacing: 1; font.family: Theme.fontFamily; Layout.topMargin: 2 }
                     ValueField {
                         Layout.fillWidth: true
                         text: win.draftValue
-                        placeholder: "напр. *.example.com  /  RU  /  app.exe"
+                        placeholder: T.s("modal.rule.ph")
                         onEdited: win.draftValue = value
                     }
 
-                    Text { text: "ДЕЙСТВИЕ"; color: Theme.textMuted; font.pixelSize: 10; font.weight: Font.DemiBold; font.letterSpacing: 1; font.family: Theme.fontFamily; Layout.topMargin: 2 }
+                    Text { text: T.s("modal.rule.action"); color: Theme.textMuted; font.pixelSize: 10; font.weight: Font.DemiBold; font.letterSpacing: 1; font.family: Theme.fontFamily; Layout.topMargin: 2 }
                     Segmented {
                         Layout.fillWidth: true
-                        options: ["Прокси", "Прямо", "Блок"]
+                        options: [T.s("seg.proxy"), T.s("seg.direct"), T.s("seg.block")]
                         currentIndex: win.draftAction
                         onSelected: win.draftAction = index
                     }
@@ -1953,7 +2533,7 @@ ApplicationWindow {
                             width: 96; height: 36; radius: 10
                             color: cancelHover.hovered ? Theme.hover : "transparent"
                             border.width: 1; border.color: Theme.stroke
-                            Text { anchors.centerIn: parent; text: "Отмена"; color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 13 }
+                            Text { anchors.centerIn: parent; text: T.s("btn.cancel"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 13 }
                             HoverHandler { id: cancelHover; cursorShape: Qt.PointingHandCursor }
                             TapHandler { onTapped: win.ruleEditorOpen = false }
                         }
@@ -1962,9 +2542,272 @@ ApplicationWindow {
                             readonly property bool ready: win.draftValue.length > 0
                             color: !ready ? Theme.surfaceAlt : (addHover2.hovered ? Qt.lighter(Theme.accent, 1.1) : Theme.accent)
                             Behavior on color { ColorAnimation { duration: Theme.durFast } }
-                            Text { anchors.centerIn: parent; text: "Добавить"; color: parent.ready ? "white" : Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 13; font.weight: Font.DemiBold }
+                            Text { anchors.centerIn: parent; text: T.s("btn.add"); color: parent.ready ? "white" : Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 13; font.weight: Font.DemiBold }
                             HoverHandler { id: addHover2; cursorShape: Qt.PointingHandCursor }
                             TapHandler { onTapped: win.addDraftRule() }
+                        }
+                    }
+                }
+            }
+
+            // оверлей: панель логов ядра (открывается только из Settings)
+            MouseArea {
+                anchors.fill: parent
+                visible: win.logsOpen
+                z: 220
+                onClicked: win.logsOpen = false
+            }
+            Rectangle {
+                id: logsModal
+                z: 221
+                anchors.centerIn: parent
+                width: Math.min(720, parent.width - 60)
+                height: Math.min(520, parent.height - 80)
+                radius: Theme.radiusLg
+                color: Theme.surface
+                border.width: 1; border.color: Theme.stroke
+                visible: opacity > 0.01
+                opacity: win.logsOpen ? 1 : 0
+                scale: win.logsOpen ? 1 : 0.96
+                Behavior on opacity { NumberAnimation { duration: Theme.durBase; easing.type: Easing.OutCubic } }
+                Behavior on scale { NumberAnimation { duration: Theme.durBase; easing.type: Easing.OutCubic } }
+                layer.enabled: true
+                layer.effect: MultiEffect { shadowEnabled: true; shadowColor: Theme.shadow; shadowBlur: 1.0; shadowVerticalOffset: 18 }
+
+                ColumnLayout {
+                    anchors.fill: parent
+                    anchors.margins: 16
+                    spacing: 10
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Text { text: T.s("logs.title"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 17; font.weight: Font.DemiBold }
+                        Item { Layout.fillWidth: true }
+                        Text {
+                            text: String.fromCharCode(0xE711)         // close glyph
+                            font.family: Theme.iconFamily; font.pixelSize: 14
+                            color: closeLogsHover.hovered ? Theme.red : Theme.textMuted
+                            Behavior on color { ColorAnimation { duration: Theme.durFast } }
+                            HoverHandler { id: closeLogsHover; cursorShape: Qt.PointingHandCursor }
+                            TapHandler { onTapped: win.logsOpen = false }
+                        }
+                    }
+
+                    // моноширинный вывод с авто-скроллом вниз
+                    Rectangle {
+                        Layout.fillWidth: true; Layout.fillHeight: true
+                        radius: Theme.radius
+                        color: Qt.darker(Theme.surface, 1.4)
+                        border.width: 1; border.color: Theme.stroke
+                        Flickable {
+                            id: logsFlick
+                            anchors.fill: parent
+                            anchors.margins: 10
+                            contentWidth: width
+                            contentHeight: logsText.implicitHeight
+                            clip: true
+                            boundsBehavior: Flickable.StopAtBounds
+                            ScrollBar.vertical: ThinScrollBar {}
+                            Text {
+                                id: logsText
+                                width: logsFlick.width
+                                text: backend.logsText
+                                color: Theme.text
+                                font.family: "Consolas, Courier New, monospace"
+                                font.pixelSize: 12
+                                wrapMode: Text.Wrap
+                                textFormat: Text.PlainText
+                                onTextChanged: {
+                                    if (logsFlick.contentHeight > logsFlick.height)
+                                        logsFlick.contentY = logsFlick.contentHeight - logsFlick.height
+                                }
+                            }
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Text {
+                            text: T.s("logs.footer")
+                            color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11
+                        }
+                        Item { Layout.fillWidth: true }
+                        Rectangle {
+                            width: 100; height: 32; radius: 9
+                            color: copyLogsHover.hovered ? Theme.hover : "transparent"
+                            border.width: 1; border.color: Theme.stroke
+                            Text { anchors.centerIn: parent; text: T.s("btn.copy"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 13 }
+                            HoverHandler { id: copyLogsHover; cursorShape: Qt.PointingHandCursor }
+                            TapHandler { onTapped: backend.copyToClipboard(backend.logsText) }
+                        }
+                        Rectangle {
+                            width: 96; height: 32; radius: 9
+                            color: clearLogsHover.hovered ? Theme.hover : "transparent"
+                            border.width: 1; border.color: Theme.stroke
+                            Text { anchors.centerIn: parent; text: T.s("btn.clear"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 13 }
+                            HoverHandler { id: clearLogsHover; cursorShape: Qt.PointingHandCursor }
+                            TapHandler { onTapped: backend.clearLogs() }
+                        }
+                    }
+                }
+            }
+
+            // оверлей: импорт правил маршрутизации из чужих клиентов
+            MouseArea {
+                anchors.fill: parent
+                visible: win.importRulesOpen
+                z: 230
+                onClicked: win.importRulesOpen = false
+            }
+            Rectangle {
+                id: importRulesModal
+                z: 231
+                anchors.centerIn: parent
+                width: Math.min(640, parent.width - 60)
+                height: Math.min(480, parent.height - 80)
+                radius: Theme.radiusLg
+                color: Theme.surface
+                border.width: 1; border.color: Theme.stroke
+                visible: opacity > 0.01
+                opacity: win.importRulesOpen ? 1 : 0
+                scale: win.importRulesOpen ? 1 : 0.96
+                Behavior on opacity { NumberAnimation { duration: Theme.durBase; easing.type: Easing.OutCubic } }
+                Behavior on scale { NumberAnimation { duration: Theme.durBase; easing.type: Easing.OutCubic } }
+                layer.enabled: true
+                layer.effect: MultiEffect { shadowEnabled: true; shadowColor: Theme.shadow; shadowBlur: 1.0; shadowVerticalOffset: 18 }
+
+                ColumnLayout {
+                    anchors.fill: parent
+                    anchors.margins: 16
+                    spacing: 10
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Text { text: T.s("modal.imp.title"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 17; font.weight: Font.DemiBold }
+                        Item { Layout.fillWidth: true }
+                        Text {
+                            text: String.fromCharCode(0xE711)
+                            font.family: Theme.iconFamily; font.pixelSize: 14
+                            color: closeImpHover.hovered ? Theme.red : Theme.textMuted
+                            Behavior on color { ColorAnimation { duration: Theme.durFast } }
+                            HoverHandler { id: closeImpHover; cursorShape: Qt.PointingHandCursor }
+                            TapHandler { onTapped: win.importRulesOpen = false }
+                        }
+                    }
+
+                    Text {
+                        text: T.s("modal.imp.hint")
+                        color: Theme.textSub; font.family: Theme.fontFamily; font.pixelSize: 11; wrapMode: Text.Wrap
+                        Layout.fillWidth: true
+                    }
+
+                    // область ввода (моноширинная)
+                    Rectangle {
+                        Layout.fillWidth: true; Layout.fillHeight: true
+                        radius: Theme.radius; color: Qt.darker(Theme.surface, 1.4)
+                        border.width: 1; border.color: Theme.stroke
+                        Flickable {
+                            id: impFlick
+                            anchors.fill: parent
+                            anchors.margins: 8
+                            contentWidth: width
+                            contentHeight: impEdit.implicitHeight
+                            clip: true
+                            boundsBehavior: Flickable.StopAtBounds
+                            ScrollBar.vertical: ThinScrollBar {}
+                            TextEdit {
+                                id: impEdit
+                                width: impFlick.width
+                                text: win.importDraft
+                                onTextChanged: win.importDraft = text
+                                color: Theme.text
+                                font.family: "Consolas, Courier New, monospace"
+                                font.pixelSize: 12
+                                wrapMode: Text.Wrap
+                                textFormat: TextEdit.PlainText
+                                selectByMouse: true
+                                selectByKeyboard: true
+                                persistentSelection: true
+                            }
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Item { Layout.fillWidth: true }
+                        Rectangle {
+                            width: 116; height: 32; radius: 9
+                            color: clipImpHover.hovered ? Theme.hover : "transparent"
+                            border.width: 1; border.color: Theme.stroke
+                            Text { anchors.centerIn: parent; text: T.s("btn.fromclip"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 13 }
+                            HoverHandler { id: clipImpHover; cursorShape: Qt.PointingHandCursor }
+                            TapHandler { onTapped: { var n = backend.importRulesFromClipboard(); if (n > 0) win.importRulesOpen = false } }
+                        }
+                        Rectangle {
+                            width: 136; height: 32; radius: 9
+                            color: doImpHover.hovered ? Qt.lighter(Theme.accent, 1.1) : Theme.accent
+                            Text { anchors.centerIn: parent; text: T.s("btn.doimport"); color: "white"; font.family: Theme.fontFamily; font.pixelSize: 13; font.weight: Font.DemiBold }
+                            HoverHandler { id: doImpHover; cursorShape: Qt.PointingHandCursor }
+                            TapHandler { onTapped: { var n = backend.importRulesText(win.importDraft); if (n > 0) win.importRulesOpen = false } }
+                        }
+                    }
+                }
+            }
+
+            // оверлей: новый профиль маршрутизации
+            MouseArea {
+                anchors.fill: parent
+                visible: win.newProfileOpen
+                z: 240
+                onClicked: win.newProfileOpen = false
+            }
+            Rectangle {
+                id: newProfileModal
+                z: 241
+                width: 380
+                anchors.centerIn: parent
+                radius: Theme.radiusLg
+                color: Theme.surface
+                border.width: 1; border.color: Theme.stroke
+                implicitHeight: npCol.implicitHeight + 36
+                visible: opacity > 0.01
+                opacity: win.newProfileOpen ? 1 : 0
+                scale: win.newProfileOpen ? 1 : 0.94
+                Behavior on opacity { NumberAnimation { duration: Theme.durBase; easing.type: Easing.OutCubic } }
+                Behavior on scale { NumberAnimation { duration: Theme.durBase; easing.type: Easing.OutCubic } }
+                layer.enabled: true
+                layer.effect: MultiEffect { shadowEnabled: true; shadowColor: Theme.shadow; shadowBlur: 1.0; shadowVerticalOffset: 16 }
+
+                ColumnLayout {
+                    id: npCol
+                    width: parent.width - 36
+                    x: 18; y: 18
+                    spacing: 10
+                    Text { text: T.s("modal.profile.title"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 17; font.weight: Font.DemiBold }
+                    Text { text: T.s("modal.sub.name"); color: Theme.textMuted; font.pixelSize: 10; font.weight: Font.DemiBold; font.letterSpacing: 1; font.family: Theme.fontFamily; Layout.topMargin: 2 }
+                    ValueField { Layout.fillWidth: true; align: TextInput.AlignLeft; text: win.newProfileName; placeholder: T.s("modal.profile.ph"); onEdited: win.newProfileName = value }
+                    Text {
+                        text: T.s("modal.profile.hint")
+                        color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; wrapMode: Text.Wrap
+                        Layout.fillWidth: true
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true; Layout.topMargin: 6
+                        Item { Layout.fillWidth: true }
+                        Rectangle {
+                            width: 96; height: 36; radius: 10
+                            color: cancelNPHover.hovered ? Theme.hover : "transparent"
+                            border.width: 1; border.color: Theme.stroke
+                            Text { anchors.centerIn: parent; text: T.s("btn.cancel"); color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 13 }
+                            HoverHandler { id: cancelNPHover; cursorShape: Qt.PointingHandCursor }
+                            TapHandler { onTapped: win.newProfileOpen = false }
+                        }
+                        Rectangle {
+                            width: 110; height: 36; radius: 10
+                            color: createNPHover.hovered ? Qt.lighter(Theme.accent, 1.1) : Theme.accent
+                            Text { anchors.centerIn: parent; text: T.s("btn.create"); color: "white"; font.family: Theme.fontFamily; font.pixelSize: 13; font.weight: Font.DemiBold }
+                            HoverHandler { id: createNPHover; cursorShape: Qt.PointingHandCursor }
+                            TapHandler { onTapped: { win.createProfile(win.newProfileName); win.newProfileOpen = false } }
                         }
                     }
                 }
@@ -1989,7 +2832,12 @@ ApplicationWindow {
         function onCurrentGroupChanged() {
             win.applySubscriptionConfig()
             if (win.managedSub.length > 0)
-                toast.show("Настройки применены из подписки «" + win.managedSub + "»", "info")
+                toast.show(T.s("sub.applied") + win.managedSub + "»", "info")
+        }
+        // импортированные правила маршрутизации — добавляем в конец списка
+        function onRulesImported(rules, fmt) {
+            if (rules && rules.length > 0)
+                win.routeRules = win.routeRules.concat(rules)
         }
     }
 }

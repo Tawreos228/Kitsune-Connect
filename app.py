@@ -17,15 +17,18 @@ import random
 import ctypes
 import winreg
 import tempfile
+import threading
+import subprocess
+from collections import deque
 from ctypes import wintypes
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote, quote
 
 import engine
 
-from PySide6.QtCore import QObject, Signal, Slot, Property, QTimer, Qt, QAbstractNativeEventFilter, QMetaObject
+from PySide6.QtCore import QObject, Signal, Slot, Property, QTimer, Qt, QAbstractNativeEventFilter, QMetaObject, QFileInfo
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor
-from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
+from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QFileIconProvider
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 
@@ -46,9 +49,23 @@ class Backend(QObject):
     autoConnectChanged = Signal()
     autoConnectModeChanged = Signal()
     hotkeyChanged = Signal()
+    # внутренние: доставка результатов фоновых задач в основной поток
+    _pingAllDone = Signal(int, "QVariantList")
+    _activePingDone = Signal(int)
+    _exitIpDone = Signal(str)
+    _subDone = Signal(int, "QVariantList", bool, int)   # gi, servers (валидные), fetched_ok, invalid_count
+    _logLine = Signal(str)                          # одна строка лога ядра (из фонового потока)
+    logsChanged = Signal()
+    coreInfoChanged = Signal()
+    _coreCheckDone = Signal("QVariantMap")
+    _coreUpdateDone = Signal(bool, str)
+    appsChanged = Signal()
+    _appsScanDone = Signal("QVariantList")
+    rulesImported = Signal("QVariantList", str)     # (rules, format)
 
     def __init__(self) -> None:
         super().__init__()
+        self._lang = "ru"                      # i18n: язык notify-сообщений; синкается из QML T.lang
         self._status = "disconnected"          # disconnected | connecting | connected
         self._server = "Netherlands · Amsterdam"
         self._ping = 0
@@ -102,7 +119,44 @@ class Backend(QObject):
         ]
 
         self._core = engine.Core()
+        self._settings: dict = {}              # настройки маршрутизации/DNS/mux из UI
         self._conn_tries = 0
+        self._tick_n = 0                       # счётчик тиков (рефреш активного пинга)
+        self._base_down = 0                    # накопительные байты ядра на момент connect
+        self._base_up = 0
+        # auto-reconnect (watchdog) — переподключиться при нештатном обрыве
+        self._reconnect_enabled = True         # синкается с QML setReconnect
+        self._user_disconnected = False        # юзер сам нажал disconnect → не переподключаемся
+        self._reconnect_attempts = 0
+        self._RECONNECT_MAX = 5
+        # kill-switch (Windows Firewall блок исходящего при нештатном обрыве)
+        self._kill_switch = False              # синкается с QML setKill
+        # КРИТИЧНО: precautionary cleanup от возможных leftover-настроек прошлого крэша.
+        # Принцип: приложение НЕ должно оставлять следов в системе после своего завершения.
+        # ВАЖНО: чистим ТАРГЕТИРОВАННО — только то, что точно наше.
+        try:
+            engine.firewall_unblock_all()    # наше rule с уникальным name — не заденет чужие
+        except Exception:
+            pass
+        try:
+            self._clean_leftover_system_proxy()
+        except Exception:
+            pass
+        self._pingAllDone.connect(self._on_ping_all)
+        self._activePingDone.connect(self._on_active_ping)
+        self._exitIpDone.connect(self._on_exit_ip)
+        self._subDone.connect(self._on_sub_done)
+        self._log_buf: deque = deque(maxlen=2000)   # rolling-буфер строк лога
+        self._logLine.connect(self._on_log_line)
+        self._core_version = engine.core_version("sing-box.exe") or ""
+        self._core_latest = ""                       # известный последний релиз sing-box
+        self._core_updating = False
+        self._coreCheckDone.connect(self._on_core_check_done)
+        self._coreUpdateDone.connect(self._on_core_update_done)
+        self._app_list: list = []                    # установленные приложения с иконками (объединённое: scan + custom)
+        self._scanned_apps_raw: list = []            # сырой результат последнего scanApps() (без иконок)
+        self._custom_apps_raw: list = []             # пользовательские (добавленные вручную через файл-пикер)
+        self._appsScanDone.connect(self._on_apps_scan_done)
         self._connect_timer = QTimer(self)       # поллинг порта во время подключения
         self._connect_timer.setInterval(300)
         self._connect_timer.timeout.connect(self._poll_connect)
@@ -111,9 +165,136 @@ class Backend(QObject):
         self._tick.setInterval(1000)
         self._tick.timeout.connect(self._on_tick)
 
-        self._ping_job = QTimer(self)
-        self._ping_job.setSingleShot(True)
-        self._ping_job.timeout.connect(self._finish_ping)
+    # ---- i18n (notify-сообщения с подстановкой args) ----
+    _NOTIFY_TR = {
+        "ru": {
+            "hotkey":            "Горячая клавиша: {text}",
+            "ksneedadmin":       "Kill-switch требует прав администратора (TUN-режим даёт их автоматически)",
+            "novalidservers":    "В группе нет валидных серверов",
+            "tunneedadmin":      "TUN требует прав администратора · перезапуск…",
+            "coreerror":         "Ошибка ядра · {err}",
+            "uacrefused":        "Повышение прав отклонено · TUN недоступен",
+            "elevatefail":       "Не удалось повысить права · {err}",
+            "conntimeout":       "Не удалось подключиться · таймаут",
+            "switched":          "Переключено · {name}",
+            "reconnectingto":    "Переподключение к · {name}",
+            "bestserver":        "Лучший сервер: {name} · {ping} ms",
+            "demoerror":         "Не удалось установить соединение · таймаут рукопожатия",
+            "mode.tunneedadmin": "Режим · TUN (при подключении запросит права администратора)",
+            "mode.proxy":        "Режим · Прокси",
+            "mode.tun":          "Режим · TUN",
+            "coreavail":         "Доступна новая версия sing-box · {tag}",
+            "coreuptodate":      "Установлена актуальная версия · {ver}",
+            "disconnectfirst":   "Сначала отключитесь — нельзя обновлять ядро при активном соединении",
+            "norelease":         "Нет данных о релизе — нажмите «Проверить обновления»",
+            "coreloading":       "Загрузка обновления ядра…",
+            "coreupdated":       "Ядро обновлено · {ver}",
+            "coreupdfail":       "Не удалось обновить · {err}",
+            "autostarton":       "Автозапуск включён",
+            "autostartoff":      "Автозапуск выключен",
+            "autostartfail":     "Не удалось изменить автозапуск · {err}",
+            "fmtunknown":        "Формат не распознан · поддерживаются sing-box JSON и Clash YAML",
+            "rulesimp":          "Импортировано правил: {n} (из {fmt})",
+            "filenotfound":      "Файл не найден · {path}",
+            "alreadyadded":      "Уже добавлено · {name}",
+            "added":             "Добавлено · {name}",
+            "subloading":        "Загрузка подписки…",
+            "subupdated":        "Подписка обновлена · {name} ({n})",
+            "subupdatedskip":    "Подписка обновлена · {name} ({n}) · пропущено битых: {skip}",
+            "suballinvalid":     "Все {n} серверов из подписки невалидны",
+            "subempty":          "Подписка пуста или формат не распознан",
+            "subloadfail":       "Не удалось загрузить подписку · {name}",
+            "subrefreshing":     "Обновление подписки…",
+            "srvnotadded":       "Сервер не добавлен · {err}",
+            "srvadded":          "Сервер добавлен · {name}",
+            "srvnotsaved":       "Не сохранён · {err}",
+            "srvupdated":        "Сервер обновлён · {name}",
+            "srvremoved":        "Сервер удалён · {name}",
+            "srvduplicated":     "Дублировано · {name}",
+            "noLinks":           "В буфере нет валидных ссылок",
+            "noneadded":         "Не добавлено · все {n} битые",
+            "imported":          "Импортировано серверов: {n}",
+            "importedskip":      "Импортировано серверов: {n} · пропущено битых: {skip}",
+            "copied":            "Скопировано",
+            "connected":         "Подключено · {name}",
+            "kscut":             "Kill-switch · интернет заблокирован до восстановления",
+            "dropped":           "Соединение оборвалось · переподключение ({tries}/{max})",
+            "dropfail":          "Не удалось восстановить соединение · переподключите вручную",
+            "reconnectfail":     "Reconnect не удался · {err}",
+            "subadded":          "Подписка добавлена · {name}",
+        },
+        "en": {
+            "hotkey":            "Hotkey: {text}",
+            "ksneedadmin":       "Kill-switch requires admin (TUN mode grants it automatically)",
+            "novalidservers":    "No valid servers in group",
+            "tunneedadmin":      "TUN requires admin · restarting…",
+            "coreerror":         "Core error · {err}",
+            "uacrefused":        "Elevation refused · TUN unavailable",
+            "elevatefail":       "Failed to elevate · {err}",
+            "conntimeout":       "Connection failed · timeout",
+            "switched":          "Switched · {name}",
+            "reconnectingto":    "Reconnecting to · {name}",
+            "bestserver":        "Best server: {name} · {ping} ms",
+            "demoerror":         "Connection failed · handshake timeout",
+            "mode.tunneedadmin": "Mode · TUN (will request admin on connect)",
+            "mode.proxy":        "Mode · Proxy",
+            "mode.tun":          "Mode · TUN",
+            "coreavail":         "New sing-box version available · {tag}",
+            "coreuptodate":      "Up to date · {ver}",
+            "disconnectfirst":   "Disconnect first — cannot update core while connected",
+            "norelease":         "No release data — press «Check for updates»",
+            "coreloading":       "Downloading core update…",
+            "coreupdated":       "Core updated · {ver}",
+            "coreupdfail":       "Update failed · {err}",
+            "autostarton":       "Autostart enabled",
+            "autostartoff":      "Autostart disabled",
+            "autostartfail":     "Failed to change autostart · {err}",
+            "fmtunknown":        "Format not recognized · supports sing-box JSON and Clash YAML",
+            "rulesimp":          "Imported rules: {n} (from {fmt})",
+            "filenotfound":      "File not found · {path}",
+            "alreadyadded":      "Already added · {name}",
+            "added":             "Added · {name}",
+            "subloading":        "Loading subscription…",
+            "subupdated":        "Subscription updated · {name} ({n})",
+            "subupdatedskip":    "Subscription updated · {name} ({n}) · skipped invalid: {skip}",
+            "suballinvalid":     "All {n} servers in subscription are invalid",
+            "subempty":          "Subscription empty or format not recognized",
+            "subloadfail":       "Failed to load subscription · {name}",
+            "subrefreshing":     "Updating subscription…",
+            "srvnotadded":       "Server not added · {err}",
+            "srvadded":          "Server added · {name}",
+            "srvnotsaved":       "Not saved · {err}",
+            "srvupdated":        "Server updated · {name}",
+            "srvremoved":        "Server removed · {name}",
+            "srvduplicated":     "Duplicated · {name}",
+            "noLinks":           "No valid links in clipboard",
+            "noneadded":         "None added · all {n} invalid",
+            "imported":          "Imported servers: {n}",
+            "importedskip":      "Imported servers: {n} · skipped invalid: {skip}",
+            "copied":            "Copied",
+            "connected":         "Connected · {name}",
+            "kscut":             "Kill-switch · internet blocked until recovery",
+            "dropped":           "Connection dropped · reconnecting ({tries}/{max})",
+            "dropfail":          "Could not restore connection · reconnect manually",
+            "reconnectfail":     "Reconnect failed · {err}",
+            "subadded":          "Subscription added · {name}",
+        },
+    }
+
+    def _tr(self, key: str, **kwargs) -> str:
+        """Перевод notify-сообщения по ключу + подстановка {args}. Fallback: ru → ключ."""
+        d = self._NOTIFY_TR.get(self._lang) or self._NOTIFY_TR["ru"]
+        tmpl = d.get(key) or self._NOTIFY_TR["ru"].get(key) or key
+        try:
+            return tmpl.format(**kwargs) if kwargs else tmpl
+        except (KeyError, IndexError):
+            return tmpl
+
+    @Slot(str)
+    def setLang(self, lang: str) -> None:
+        """Установка языка для Backend notify-сообщений. Зовётся из QML при смене T.lang."""
+        if lang in self._NOTIFY_TR:
+            self._lang = lang
 
     # ---- properties ----
     def _get_status(self) -> str:
@@ -220,12 +401,45 @@ class Backend(QObject):
         self._hk_mods = mods
         self._hk_vk = vk
         self.hotkeyChanged.emit()
-        self.notify.emit("Горячая клавиша: " + text, "info")
+        self.notify.emit(self._tr("hotkey", text=text), "info")
 
     @Slot(bool)
     def suspendHotkey(self, s: bool) -> None:
         self._hk_suspended = s
         self.hotkeyChanged.emit()
+
+    @Slot(str)
+    def applyConfig(self, snapshot: str) -> None:
+        """Принять снимок настроек из QML и привести к контракту engine.gen_config."""
+        try:
+            s = json.loads(snapshot or "{}") or {}
+        except (ValueError, TypeError):
+            return
+        self._settings = {
+            "portMixed": s.get("portMixed"),
+            "sniff": s.get("setSniff", True),
+            "mux": s.get("setMux", False),
+            "muxProto": s.get("muxProto", 0),
+            "fakeip": s.get("setFakeIp", True),
+            "dnsRemote": s.get("dnsRemote"),
+            "dnsDirect": s.get("dnsDirect"),
+            "rtLan": s.get("rtLan", True),
+            "rtRegionDirect": s.get("rtRegionDirect", True),
+            "rtAdblock": s.get("rtAdblock", False),
+            "rtProxyAll": s.get("rtProxyAll", False),
+            "rtFinal": s.get("rtFinal", 0),
+            "routeRules": s.get("routeRules", []),
+            "tunStack": s.get("tunStack", 0),
+            "strictRoute": s.get("setStrictRoute", True),
+            "mtu": s.get("mtu"),
+            "lan": s.get("setLan", False),
+        }
+
+    def _effective_port(self) -> int:
+        try:
+            return int(self._settings.get("portMixed") or engine.MIXED_PORT)
+        except (TypeError, ValueError):
+            return engine.MIXED_PORT
 
     # ---- actions ----
     @Slot()
@@ -233,10 +447,12 @@ class Backend(QObject):
         if self._status == "disconnected":
             self._begin_connect()
         elif self._status == "connecting":
+            self._user_disconnected = True
             self._connect_timer.stop()
             self._core.stop()
             self._set_status("disconnected")
         else:
+            self._user_disconnected = True
             self._disconnect()
 
     def _selected_server(self):
@@ -245,31 +461,134 @@ class Backend(QObject):
                 return s
         return None
 
+    @Slot(bool)
+    def setReconnectEnabled(self, on: bool) -> None:
+        """Включить/выключить watchdog-переподключения при нештатном обрыве."""
+        self._reconnect_enabled = bool(on)
+
+    @Slot(bool)
+    def setKillSwitchEnabled(self, on: bool) -> None:
+        """Kill-switch: блок всего исходящего трафика через netsh при нештатном обрыве.
+        Требует админ-прав. При выключении тумблера — немедленная разблокировка (если что-то висело)."""
+        self._kill_switch = bool(on)
+        if not on:
+            # снимаем правило, если вдруг было активно
+            try:
+                engine.firewall_unblock_all()
+            except Exception:
+                pass
+        elif not engine.is_admin():
+            self.notify.emit(self._tr("ksneedadmin"), "info")
+
+    def _valid_servers_of_group(self) -> list:
+        """Сервера активной группы с проставленным флагом _valid (выставляется при импорте).
+        Фильтрация мгновенная — НЕ дёргаем sing-box check здесь (иначе на больших подписках UI замёрз бы
+        на секунды каждый раз при connect/select). Default True для серверов без флага (мок/legacy)."""
+        return [s for s in self._cur()["servers"] if s.get("_valid", True)]
+
+    def _active_idx_in(self, valid_list: list) -> int:
+        """Индекс активного сервера (по self._server) внутри списка валидных. -1 если не нашли."""
+        for i, s in enumerate(valid_list):
+            if s.get("country", "") + " · " + s.get("city", "") == self._server:
+                return i
+        return -1
+
     def _begin_connect(self) -> None:
-        srv = self._selected_server()
-        if not srv or not srv.get("address"):
-            self.notify.emit("Нет данных сервера — выберите рабочий профиль", "error")
+        valid = self._valid_servers_of_group()
+        if not valid:
+            self.notify.emit(self._tr("novalidservers"), "error")
             return
+        # активный должен быть среди валидных; если выбранный битый — берём первого
+        active_idx = self._active_idx_in(valid)
+        if active_idx < 0:
+            active_idx = 0
+            first = valid[0]
+            self._server = first["country"] + " · " + first["city"]
+            self.serverChanged.emit()
+        # пользовательский connect — намерение «хочу быть подключённым»
+        self._user_disconnected = False
+        self._reconnect_attempts = 0
+        tun = self._mode == "tun"
+        if tun and not engine.is_admin():
+            # TUN создаёт системный сетевой адаптер → нужны права администратора.
+            # Перезапускаем приложение с повышением прав (UAC), затем юзер подключается снова.
+            self.notify.emit(self._tr("tunneedadmin"), "info")
+            self._relaunch_as_admin()
+            return
+        settings = dict(self._settings)
+        settings["tun"] = tun
+        settings["activeIdx"] = active_idx
+        # передаём ВЕСЬ список валидных серверов: engine соберёт selector-outbound (если их 2+)
+        # или одиночный outbound (если 1) — это и даёт seamless server switch.
         self._set_status("connecting")
         try:
-            self._core.start(srv)
+            # on_log вызывается из фонового потока ядра → emit Signal (queued в основной поток)
+            self._core.start(valid, settings, on_log=self._logLine.emit)
         except Exception as e:
             self._set_status("disconnected")
-            self.notify.emit("Ошибка ядра · " + str(e)[:80], "error")
+            self.notify.emit(self._tr("coreerror", err=str(e)[:80]), "error")
             return
         self._conn_tries = 0
         self._connect_timer.start()
 
+    def _relaunch_as_admin(self) -> None:
+        """Перезапуск процесса с правами администратора (через ShellExecute 'runas')."""
+        try:
+            self._core.stop()
+            self._set_system_proxy(False)
+        except Exception:
+            pass
+        try:
+            if getattr(sys, "frozen", False):           # собранный exe (PyInstaller)
+                exe = sys.executable
+                params = subprocess.list2cmdline(sys.argv[1:])
+                workdir = os.path.dirname(sys.executable)
+            else:                                        # запуск через интерпретатор
+                exe = sys.executable
+                script = os.path.abspath(sys.argv[0])
+                params = subprocess.list2cmdline([script] + sys.argv[1:])
+                workdir = os.path.dirname(script)
+            r = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, workdir, 1)
+            if int(r) > 32:
+                QApplication.instance().quit()           # успешно — закрываем неэлевейтнутый инстанс
+            else:
+                self.notify.emit(self._tr("uacrefused"), "error")
+        except Exception as e:
+            self.notify.emit(self._tr("elevatefail", err=str(e)[:60]), "error")
+
     def _poll_connect(self) -> None:
         self._conn_tries += 1
-        if engine.port_listening():
+        if engine.port_listening(self._effective_port()):
             self._connect_timer.stop()
             self._on_connected()
         elif self._conn_tries > 26:          # ~8 c
             self._connect_timer.stop()
             self._core.stop()
             self._set_status("disconnected")
-            self.notify.emit("Не удалось подключиться · таймаут", "error")
+            self.notify.emit(self._tr("conntimeout"), "error")
+
+    def _clean_leftover_system_proxy(self) -> None:
+        """При старте Backend: выключаем системный прокси ТОЛЬКО если он наш (127.0.0.1:...).
+        Если юзер использует Fiddler/Charles/любой другой прокси-софт — не трогаем его настройки."""
+        try:
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+                0, winreg.KEY_READ)
+            try:
+                enabled, _ = winreg.QueryValueEx(key, "ProxyEnable")
+            except FileNotFoundError:
+                enabled = 0
+            try:
+                server, _ = winreg.QueryValueEx(key, "ProxyServer")
+            except FileNotFoundError:
+                server = ""
+            winreg.CloseKey(key)
+        except Exception:
+            return
+        # Только если прокси включён И указывает на наш loopback — это leftover от нашего крэша
+        if enabled and isinstance(server, str) and server.startswith("127.0.0.1:"):
+            self._set_system_proxy(False)
 
     def _set_system_proxy(self, enable: bool, port: int = engine.MIXED_PORT) -> None:
         try:
@@ -297,10 +616,12 @@ class Backend(QObject):
     @Slot()
     def disconnectVpn(self) -> None:
         if self._status == "connecting":
+            self._user_disconnected = True
             self._connect_timer.stop()
             self._core.stop()
             self._set_status("disconnected")
         elif self._status == "connected":
+            self._user_disconnected = True
             self._disconnect()
 
     @Slot(str)
@@ -309,14 +630,30 @@ class Backend(QObject):
             return
         self._server = name
         self.serverChanged.emit()
-        # бесшовно: соединение не рвём, меняем выходной узел "на лету"
+        # бесшовно: соединение не рвём, дёргаем Clash API чтобы селектор показал на новый outbound
         if self._status == "connected":
-            for s in self._cur()["servers"]:
+            valid = self._valid_servers_of_group()
+            idx = self._active_idx_in(valid)
+            for s in valid:
                 if s["country"] + " · " + s["city"] == name:
-                    self._ping = s["ping"]
+                    self._ping = s.get("ping", 0)
                     break
             self.statsChanged.emit()
-            self.notify.emit("Переключено · " + name, "success")
+            if len(valid) >= 2 and idx >= 0:
+                # вызываем PUT /proxies/proxy в фоне (HTTP localhost — быстро, но всё же)
+                target = engine.server_tag(idx)
+                def work() -> None:
+                    ok = engine.clash_select(target)
+                    # пинг свежий — обновим через активный пинг (URL-delay)
+                    if ok:
+                        self._refresh_active_ping()
+                threading.Thread(target=work, daemon=True).start()
+                self.notify.emit(self._tr("switched", name=name), "success")
+            else:
+                # одиночный сервер или невалидная позиция — переподключаем штатно
+                self.notify.emit(self._tr("reconnectingto", name=name), "info")
+                self._disconnect()
+                self._begin_connect()
 
     @Slot()
     def selectBest(self) -> None:
@@ -329,7 +666,7 @@ class Backend(QObject):
         if self._status == "connected":
             self._ping = best["ping"]
             self.statsChanged.emit()
-        self.notify.emit(f"Лучший сервер: {self._server} · {best['ping']} ms", "success")
+        self.notify.emit(self._tr("bestserver", name=self._server, ping=best['ping']), "success")
 
     @Slot()
     def simulateError(self) -> None:
@@ -338,47 +675,52 @@ class Backend(QObject):
             self._connect_timer.stop()
         self._tick.stop()
         self._set_status("disconnected")
-        self.notify.emit(
-            "Не удалось установить соединение · таймаут рукопожатия",
-            "error",
-        )
+        self.notify.emit(self._tr("demoerror"), "error")
 
     @Slot(str)
     def setMode(self, m: str) -> None:
-        if m != self._mode:
-            self._mode = m
-            self.modeChanged.emit()
-            self.notify.emit("Режим · " + ("TUN" if m == "tun" else "Прокси"), "info")
+        if m == self._mode:
+            return
+        self._mode = m
+        self.modeChanged.emit()
+        if m == "tun" and not engine.is_admin():
+            self.notify.emit(self._tr("mode.tunneedadmin"), "info")
+        else:
+            self.notify.emit(self._tr("mode.tun" if m == "tun" else "mode.proxy"), "info")
+        # если уже подключены — переподнимаем ядро с новым inbound (proxy↔tun)
+        if self._status == "connected":
+            self._disconnect()
+            self._begin_connect()
 
     @Slot()
     def pingAll(self) -> None:
+        """Реальный TCP-connect пинг серверов текущей группы (в фоновом потоке)."""
         if self._pinging:
             return
         self._pinging = True
         self.pingingChanged.emit()
-        self._ping_job.start(900)
+        gi = self._currentGroup
+        servers = [dict(s) for s in self._cur()["servers"]]
 
-    @Slot()
-    def startup(self) -> None:
-        """Запуск приложения: сразу пингуем сервера, затем (опционально) автоподключение."""
-        self._pending_autoconnect = self._auto_connect and self._status == "disconnected"
-        self.pingAll()
+        def work() -> None:
+            results = [engine.tcp_ping(s.get("address"), s.get("port") or 443)
+                       for s in servers]
+            self._pingAllDone.emit(gi, results)
 
-    def _finish_ping(self) -> None:
-        base = {"NL": 36, "DE": 50, "US": 92, "GB": 60, "FR": 46,
-                "SE": 68, "JP": 135, "SG": 150}
-        g = dict(self._groups[self._currentGroup])
-        g["servers"] = [
-            {**s, "ping": max(8, base.get(s["code"], 80) + random.randint(-12, 22))}
-            for s in g["servers"]
-        ]
-        self._groups = self._groups[:self._currentGroup] + [g] + self._groups[self._currentGroup + 1:]
-        if self._status == "connected":
-            for s in g["servers"]:
-                if s["country"] + " · " + s["city"] == self._server:
-                    self._ping = s["ping"]
-                    self.statsChanged.emit()
-                    break
+        threading.Thread(target=work, daemon=True).start()
+
+    @Slot(int, "QVariantList")
+    def _on_ping_all(self, gi: int, results: list) -> None:
+        if 0 <= gi < len(self._groups):
+            g = dict(self._groups[gi])
+            new = []
+            for s, ms in zip(g["servers"], results):
+                ns = dict(s)
+                if ms is not None:           # недоступные/без адреса — прежнее значение
+                    ns["ping"] = ms
+                new.append(ns)
+            g["servers"] = new
+            self._groups = self._groups[:gi] + [g] + self._groups[gi + 1:]
         self._pinging = False
         self.groupsChanged.emit()
         self.serversChanged.emit()
@@ -391,6 +733,335 @@ class Backend(QObject):
             srv = self._selected_server()
             if self._status == "disconnected" and srv and srv.get("address"):
                 self.toggle()              # подключиться (только если профиль рабочий)
+
+    @Slot()
+    def startup(self) -> None:
+        """Запуск приложения: сразу пингуем сервера, затем (опционально) автоподключение."""
+        self._pending_autoconnect = self._auto_connect and self._status == "disconnected"
+        self.pingAll()
+
+    def _refresh_active_ping(self) -> None:
+        """URL-delay активного proxy через Clash API (в потоке)."""
+        def work() -> None:
+            d = engine.clash_delay()
+            self._activePingDone.emit(int(d) if d else 0)
+        threading.Thread(target=work, daemon=True).start()
+
+    @Slot(int)
+    def _on_active_ping(self, ms: int) -> None:
+        if self._status == "connected" and ms > 0:
+            self._ping = ms
+            self.statsChanged.emit()
+
+    def _refresh_exit_ip(self) -> None:
+        """Реальный внешний IP через mixed-прокси ядра (подтверждает туннель)."""
+        port = self._effective_port()
+        def work() -> None:
+            ip = engine.exit_ip(port)
+            if ip:
+                self._exitIpDone.emit(ip)
+        threading.Thread(target=work, daemon=True).start()
+
+    @Slot(str)
+    def _on_exit_ip(self, ip: str) -> None:
+        if self._status == "connected":
+            self._exit_ip = ip
+            self.statsChanged.emit()
+
+    @Slot(str)
+    def _on_log_line(self, line: str) -> None:
+        """Принять строку лога ядра в основной поток (через Signal _logLine)."""
+        self._log_buf.append(line)
+        self.logsChanged.emit()
+
+    def _get_logs_text(self) -> str:
+        return "\n".join(self._log_buf)
+
+    logsText = Property(str, _get_logs_text, notify=logsChanged)
+
+    @Slot()
+    def clearLogs(self) -> None:
+        self._log_buf.clear()
+        self.logsChanged.emit()
+
+    # ---- авто-обновление ядра sing-box ----
+    def _get_core_version(self) -> str: return self._core_version
+    def _get_core_latest(self) -> str:  return self._core_latest
+    def _get_core_updating(self) -> bool: return self._core_updating
+    def _get_core_has_update(self) -> bool:
+        return bool(self._core_latest) and bool(self._core_version) and self._core_latest != self._core_version
+
+    coreVersion          = Property(str,  _get_core_version, notify=coreInfoChanged)
+    coreLatest           = Property(str,  _get_core_latest,  notify=coreInfoChanged)
+    coreUpdateAvailable  = Property(bool, _get_core_has_update, notify=coreInfoChanged)
+    coreUpdating         = Property(bool, _get_core_updating, notify=coreInfoChanged)
+
+    @Slot()
+    def checkCoreUpdate(self) -> None:
+        """ТИХАЯ проверка обновлений (используется при автозапуске): уведомление только при находке апдейта."""
+        self._next_check_silent = True
+        self._launch_core_check()
+
+    @Slot()
+    def checkCoreUpdateForce(self) -> None:
+        """Ручная проверка из UI: уведомление в обе стороны (есть/нет апдейта)."""
+        self._next_check_silent = False
+        self._launch_core_check()
+
+    def _launch_core_check(self) -> None:
+        def work() -> None:
+            sb = engine.latest_singbox_release()
+            self._coreCheckDone.emit({
+                "sb_tag": (sb or {}).get("tag", ""),
+                "sb_url": (sb or {}).get("url", ""),
+            })
+        threading.Thread(target=work, daemon=True).start()
+
+    @Slot("QVariantMap")
+    def _on_core_check_done(self, d: dict) -> None:
+        sb_tag = (d.get("sb_tag") or "").strip()
+        self._core_latest = sb_tag
+        self._core_latest_url = d.get("sb_url") or ""
+        self.coreInfoChanged.emit()
+        if self._get_core_has_update():
+            # мягкое предложение — обычный info-тост, не блокирует
+            self.notify.emit(self._tr("coreavail", tag=sb_tag), "info")
+        elif not getattr(self, "_next_check_silent", True):
+            # тихая авто-проверка молчит при «нет апдейтов»; ручная даёт явный фидбек
+            self.notify.emit(self._tr("coreuptodate", ver=(self._core_version or "—")), "success")
+
+    @Slot()
+    def updateCore(self) -> None:
+        """Скачать и установить последний sing-box.exe (только если соединение отключено)."""
+        if self._status != "disconnected":
+            self.notify.emit(self._tr("disconnectfirst"), "error")
+            return
+        url = getattr(self, "_core_latest_url", "")
+        if not url:
+            self.notify.emit(self._tr("norelease"), "error")
+            return
+        self._core_updating = True
+        self.coreInfoChanged.emit()
+        self.notify.emit(self._tr("coreloading"), "info")
+
+        def work() -> None:
+            ok, msg = engine.install_core_update(url, "sing-box.exe")
+            self._coreUpdateDone.emit(ok, msg)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    @Slot(bool, str)
+    def _on_core_update_done(self, ok: bool, msg: str) -> None:
+        self._core_updating = False
+        if ok:
+            self._core_version = engine.core_version("sing-box.exe") or self._core_version
+            self.notify.emit(self._tr("coreupdated", ver=self._core_version), "success")
+        else:
+            self.notify.emit(self._tr("coreupdfail", err=msg), "error")
+        self.coreInfoChanged.emit()
+
+    @Slot(str)
+    def openUrl(self, url: str) -> None:
+        """Открыть внешнюю ссылку в системном браузере."""
+        try:
+            os.startfile(url)
+        except Exception:
+            pass
+
+    # ---- автозапуск с системой (HKCU\Software\Microsoft\Windows\CurrentVersion\Run) ----
+    _AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    _AUTOSTART_VAL = "Kitsune"
+
+    def _autostart_command(self) -> str:
+        """Строка для записи в реестр: запуск собранного exe либо python+script с правильными кавычками."""
+        if getattr(sys, "frozen", False):
+            return f'"{sys.executable}"'
+        script = os.path.abspath(sys.argv[0])
+        return f'"{sys.executable}" "{script}"'
+
+    @Slot(bool)
+    def setAutostart(self, on: bool) -> None:
+        """Прописать/убрать запись в HKCU Run для автозапуска при входе в Windows."""
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, self._AUTOSTART_KEY,
+                                 0, winreg.KEY_SET_VALUE)
+            if on:
+                winreg.SetValueEx(key, self._AUTOSTART_VAL, 0, winreg.REG_SZ,
+                                  self._autostart_command())
+                self.notify.emit(self._tr("autostarton"), "success")
+            else:
+                try:
+                    winreg.DeleteValue(key, self._AUTOSTART_VAL)
+                except FileNotFoundError:
+                    pass
+                self.notify.emit(self._tr("autostartoff"), "info")
+            winreg.CloseKey(key)
+        except Exception as e:
+            self.notify.emit(self._tr("autostartfail", err=str(e)[:80]), "error")
+
+    @Slot(result=bool)
+    def isAutostartEnabled(self) -> bool:
+        """Проверить, прописан ли наш автозапуск (для синка QML-тумблера на старте)."""
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, self._AUTOSTART_KEY,
+                                 0, winreg.KEY_READ)
+            try:
+                val, _ = winreg.QueryValueEx(key, self._AUTOSTART_VAL)
+                return bool(val)
+            except FileNotFoundError:
+                return False
+            finally:
+                winreg.CloseKey(key)
+        except Exception:
+            return False
+
+    # ---- per-app: сканер установленных приложений + извлечение иконок ----
+    def _get_app_list(self) -> list:
+        return self._app_list
+
+    appList = Property("QVariantList", _get_app_list, notify=appsChanged)
+
+    @Slot()
+    def scanApps(self) -> None:
+        """Асинхронно сканировать установленные приложения (Start Menu .lnk → exe)."""
+        def work() -> None:
+            self._appsScanDone.emit(engine.scan_apps_raw())
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---- импорт правил маршрутизации из других клиентов ----
+    @Slot(str, result=int)
+    def importRulesText(self, text: str) -> int:
+        """Парсит вставленный текст (sing-box JSON / Clash YAML) → эмитит rulesImported.
+        Возвращает количество найденных правил (0 если формат не распознан)."""
+        d = engine.parse_imported_rules(text or "")
+        fmt = d.get("format", "unknown")
+        rules = d.get("rules", [])
+        if fmt == "unknown" or not rules:
+            self.notify.emit(self._tr("fmtunknown"), "error")
+            return 0
+        self.rulesImported.emit(rules, fmt)
+        self.notify.emit(self._tr("rulesimp", n=len(rules), fmt=fmt), "success")
+        return len(rules)
+
+    @Slot(result=int)
+    def importRulesFromClipboard(self) -> int:
+        return self.importRulesText(QApplication.clipboard().text())
+
+    @Slot("QVariantList")
+    def _on_apps_scan_done(self, raw: list) -> None:
+        """Сырой результат сканирования сохраняем + пересобираем итоговый appList (scan ∪ custom)."""
+        self._scanned_apps_raw = list(raw or [])
+        self._rebuild_app_list()
+
+    def _rebuild_app_list(self) -> None:
+        """Объединяет scanned + custom, извлекает иконки в main-thread через QFileIconProvider.
+        Custom-записи помечены `custom: True` и идут в начале списка."""
+        import hashlib
+        from pathlib import Path
+        icon_dir = Path(tempfile.gettempdir()) / "kitsune_icons"
+        try:
+            icon_dir.mkdir(exist_ok=True)
+        except Exception:
+            pass
+        provider = QFileIconProvider()
+        seen: set = set()
+        full: list = []
+
+        def make_entry(app: dict, custom: bool) -> dict | None:
+            exe = (app.get("exe") or "").strip()
+            if not exe:
+                return None
+            key = os.path.basename(exe).lower()
+            if key in seen:
+                return None
+            seen.add(key)
+            icon_url = ""
+            try:
+                info = QFileInfo(exe)
+                ic = provider.icon(info)
+                pix = ic.pixmap(32, 32)
+                if not pix.isNull():
+                    h = hashlib.md5(exe.encode("utf-8", "ignore")).hexdigest()[:16]
+                    png = icon_dir / (h + ".png")
+                    if pix.save(str(png), "PNG"):
+                        icon_url = "file:///" + str(png).replace("\\", "/")
+            except Exception:
+                pass
+            return {
+                "name": (app.get("name") or "").strip() or os.path.splitext(os.path.basename(exe))[0],
+                "exe": exe,
+                "exeName": os.path.basename(exe),
+                "icon": icon_url,
+                "custom": custom,
+            }
+
+        # сначала пользовательские (приоритет над сканом при совпадении basename)
+        for app in self._custom_apps_raw:
+            e = make_entry(app, True)
+            if e:
+                full.append(e)
+        # затем результаты сканирования
+        for app in self._scanned_apps_raw:
+            e = make_entry(app, False)
+            if e:
+                full.append(e)
+        self._app_list = full
+        self.appsChanged.emit()
+
+    @Slot()
+    def addCustomAppDialog(self) -> None:
+        """Открывает системный файл-пикер для выбора exe-файла приложения. Добавляет его в кастом-список."""
+        from PySide6.QtWidgets import QFileDialog
+        path, _filt = QFileDialog.getOpenFileName(
+            None, "Выбрать exe-файл приложения",
+            os.environ.get("ProgramFiles", "C:\\"),
+            "Программы (*.exe);;Все файлы (*)")
+        if not path:
+            return
+        self._add_custom_app(os.path.splitext(os.path.basename(path))[0], path)
+
+    def _add_custom_app(self, name: str, exe: str) -> None:
+        if not exe or not os.path.exists(exe):
+            self.notify.emit(self._tr("filenotfound", path=exe[:80]), "error")
+            return
+        key = os.path.basename(exe).lower()
+        # дедуп: если уже есть среди custom — пропускаем
+        for a in self._custom_apps_raw:
+            if os.path.basename(a.get("exe", "")).lower() == key:
+                self.notify.emit(self._tr("alreadyadded", name=(a.get("name") or exe)), "info")
+                return
+        self._custom_apps_raw.append({"name": name, "exe": exe})
+        self._rebuild_app_list()
+        self.notify.emit(self._tr("added", name=name), "success")
+
+    @Slot(str)
+    def removeCustomApp(self, exe_name: str) -> None:
+        key = (exe_name or "").lower()
+        self._custom_apps_raw = [
+            a for a in self._custom_apps_raw
+            if os.path.basename(a.get("exe", "")).lower() != key
+        ]
+        self._rebuild_app_list()
+
+    @Slot(str)
+    def setCustomAppsJson(self, json_str: str) -> None:
+        """Восстановление списка пользовательских приложений из снимка настроек (на старте)."""
+        try:
+            arr = json.loads(json_str or "[]")
+        except (ValueError, TypeError):
+            arr = []
+        if not isinstance(arr, list):
+            return
+        self._custom_apps_raw = [
+            {"name": (a.get("name") or "").strip(), "exe": (a.get("exe") or "").strip()}
+            for a in arr if isinstance(a, dict) and a.get("exe")
+        ]
+        self._rebuild_app_list()
+
+    def _get_custom_apps_json(self) -> str:
+        return json.dumps(self._custom_apps_raw, ensure_ascii=False)
+
+    customAppsJson = Property(str, _get_custom_apps_json, notify=appsChanged)
 
     # ---- группы / подписки ----
     @Slot(int)
@@ -408,21 +1079,96 @@ class Backend(QObject):
 
     @Slot(str, str, bool)
     def addSubscription(self, name: str, url: str, auto: bool) -> None:
-        pool = [("US", "United States", "Los Angeles"), ("CA", "Canada", "Toronto"),
-                ("NL", "Netherlands", "Rotterdam"), ("DE", "Germany", "Berlin"),
-                ("FI", "Finland", "Helsinki"), ("JP", "Japan", "Osaka")]
-        picks = random.sample(pool, 3)
-        servers = [{"code": c, "country": co, "city": ci, "ping": random.randint(40, 160)}
-                   for c, co, ci in picks]
+        gi = len(self._groups)
         self._groups = self._groups + [{
             "name": name or "Новая подписка", "type": "subscription", "url": url,
-            "updated": "только что", "auto": auto,
+            "updated": "загрузка…", "auto": auto,
             "config": {"dns": "https://1.1.1.1/dns-query", "adblock": False, "final": 0},
-            "servers": servers,
+            "servers": [],
         }]
         self.groupsChanged.emit()
-        self.notify.emit("Подписка добавлена · " + (name or "Новая"), "success")
-        self.setCurrentGroup(len(self._groups) - 1)
+        self.setCurrentGroup(gi)
+        self.notify.emit(self._tr("subloading"), "info")
+        self._refresh_subscription(gi)
+
+    @staticmethod
+    def _decode_subscription(text: str) -> list:
+        """Тело подписки -> список ссылок. Поддержка base64-блоба и плейн-текста."""
+        raw = (text or "").strip()
+        content = raw
+        try:
+            dec = base64.b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8", "ignore")
+            if "://" in dec:
+                content = dec
+        except Exception:
+            pass
+        return [x for x in re.split(r"\s+", content) if "://" in x]
+
+    def _refresh_subscription(self, gi: int) -> None:
+        """Асинхронно: загрузить URL подписки, распарсить ссылки, провалидировать каждый
+        через sing-box check, отсеять битые — ВСЁ в фоновом потоке. Main-thread получает
+        уже готовый список валидных + счётчик битых, не зависая."""
+        if not (0 <= gi < len(self._groups)):
+            return
+        url = self._groups[gi].get("url") or ""
+
+        def work() -> None:
+            text = engine.fetch_subscription(url)
+            valid_servers: list = []
+            invalid = 0
+            if text:
+                links = self._decode_subscription(text)
+                for l in links:
+                    d = self._parse_link(l)
+                    if not d:
+                        continue
+                    srv = self._make_server(d)
+                    ok, _err = self._validate_server(srv)
+                    srv["_valid"] = ok           # кэш — потом _valid_servers_of_group берёт мгновенно
+                    if ok:
+                        valid_servers.append(srv)
+                    else:
+                        invalid += 1
+            self._subDone.emit(gi, valid_servers, text is not None, invalid)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    @Slot(int, "QVariantList", bool, int)
+    def _on_sub_done(self, gi: int, servers: list, ok: bool, invalid: int) -> None:
+        if not (0 <= gi < len(self._groups)):
+            return
+        g = dict(self._groups[gi])
+        if ok and servers:
+            fav = {(s.get("address"), s.get("port"))
+                   for s in g["servers"] if s.get("fav")}
+            for s in servers:
+                if (s.get("address"), s.get("port")) in fav:
+                    s["fav"] = True
+            g["servers"] = servers
+            g["updated"] = "только что"
+            if invalid:
+                self.notify.emit(self._tr("subupdatedskip", name=g['name'], n=len(servers), skip=invalid), "info")
+            else:
+                self.notify.emit(self._tr("subupdated", name=g['name'], n=len(servers)), "success")
+        elif ok and invalid:
+            g["updated"] = "ошибка"
+            self.notify.emit(self._tr("suballinvalid", n=invalid), "error")
+        elif ok:
+            g["updated"] = "пусто"
+            self.notify.emit(self._tr("subempty"), "error")
+        else:
+            g["updated"] = "ошибка загрузки"
+            self.notify.emit(self._tr("subloadfail", name=g["name"]), "error")
+        self._groups = self._groups[:gi] + [g] + self._groups[gi + 1:]
+        self.groupsChanged.emit()
+        if gi == self._currentGroup:
+            s0 = g["servers"][0] if g["servers"] else None
+            if s0:
+                self._server = s0["country"] + " · " + s0["city"]
+                self.serverChanged.emit()
+            self.serversChanged.emit()
+            if g["servers"]:
+                self.pingAll()          # реальные пинги для свежих серверов (уже в треде)
 
     @Slot(int)
     def removeGroup(self, i: int) -> None:
@@ -444,14 +1190,11 @@ class Backend(QObject):
     def updateGroup(self, i: int) -> None:
         if i < 0 or i >= len(self._groups):
             return
-        g = dict(self._groups[i])
-        g["servers"] = [{**s, "ping": max(8, s["ping"] + random.randint(-15, 15))} for s in g["servers"]]
-        g["updated"] = "только что"
-        self._groups = self._groups[:i] + [g] + self._groups[i + 1:]
-        self.groupsChanged.emit()
-        if i == self._currentGroup:
-            self.serversChanged.emit()
-        self.notify.emit("Подписка обновлена · " + g["name"], "success")
+        if self._groups[i].get("url"):
+            self.notify.emit(self._tr("subrefreshing"), "info")
+            self._refresh_subscription(i)
+        else:                              # ручная группа — просто перемерить пинги
+            self.pingAll()
 
     @Slot(int, bool)
     def setGroupAuto(self, i: int, val: bool) -> None:
@@ -465,7 +1208,9 @@ class Backend(QObject):
     # ---- сервера (профили) ----
     _PROFILE_KEYS = ["protocol", "address", "port", "uuid", "password", "method",
                      "tls", "sni", "reality", "pbk", "sid", "transport", "path",
-                     "host", "serviceName", "wgKey", "flow", "name", "encryption", "fp"]
+                     "host", "serviceName", "wgKey", "flow", "name", "encryption", "fp",
+                     # WireGuard-only:
+                     "peerKey", "localAddr", "allowedIps", "mtu", "psk"]
 
     def _make_server(self, data: dict, keep_ping=None) -> dict:
         name = (data.get("name") or "").strip() or (data.get("address") or "Сервер")
@@ -488,12 +1233,40 @@ class Backend(QObject):
         self.groupsChanged.emit()
         self.serversChanged.emit()
 
+    def _validate_server(self, srv: dict) -> tuple[bool, str]:
+        """Прогоняет профиль через sing-box check (нашу же gen_config). Возвращает (ok, message).
+        Ловит: невалидные ключи reality, кривой UUID, неверная encryption-строка, и т.п. — то, что
+        иначе всплыло бы только при connect."""
+        if not srv or not srv.get("address") or not srv.get("port"):
+            return False, "нет адреса или порта"
+        try:
+            ok, msg = engine.check_config(engine.gen_config(srv, {}))
+        except Exception as e:
+            return False, str(e)[:120]
+        if ok:
+            return True, ""
+        # упрощаем сообщение — берём последнюю строку с FATAL/error/invalid + чистим ANSI-цвета
+        ansi_re = re.compile(r"\x1b\[[0-9;]*m")
+        for line in reversed((msg or "").splitlines()):
+            clean = ansi_re.sub("", line).strip()
+            ll = clean.lower()
+            if "fatal" in ll or "error" in ll or "invalid" in ll:
+                # обрезаем технический префикс "FATAL[0000] " если есть
+                clean = re.sub(r"^(FATAL|ERROR|WARN)\[\d+\]\s*", "", clean)
+                return False, clean[:140]
+        return False, ansi_re.sub("", msg or "невалидный конфиг")[:140]
+
     @Slot("QVariantMap")
     def addServer(self, data: dict) -> None:
         srv = self._make_server(data)
+        ok, err = self._validate_server(srv)
+        srv["_valid"] = ok                  # кэш для будущих _valid_servers_of_group
+        if not ok:
+            self.notify.emit(self._tr("srvnotadded", err=err), "error")
+            return
         servers = list(self._cur()["servers"]) + [srv]
         self._replace_group_servers(servers)
-        self.notify.emit("Сервер добавлен · " + srv["country"], "success")
+        self.notify.emit(self._tr("srvadded", name=srv["country"]), "success")
 
     @Slot(int, "QVariantMap")
     def updateServer(self, i: int, data: dict) -> None:
@@ -503,9 +1276,14 @@ class Backend(QObject):
         old = servers[i]
         srv = self._make_server(data, keep_ping=old.get("ping", 60))
         srv["fav"] = old.get("fav", False)
+        ok, err = self._validate_server(srv)
+        srv["_valid"] = ok
+        if not ok:
+            self.notify.emit(self._tr("srvnotsaved", err=err), "error")
+            return
         servers[i] = srv
         self._replace_group_servers(servers)
-        self.notify.emit("Сервер обновлён · " + srv["country"], "info")
+        self.notify.emit(self._tr("srvupdated", name=srv["country"]), "info")
 
     @Slot(int)
     def removeServer(self, i: int) -> None:
@@ -519,7 +1297,7 @@ class Backend(QObject):
             s0 = servers[0]
             self._server = s0["country"] + " · " + s0["city"]
             self.serverChanged.emit()
-        self.notify.emit("Сервер удалён · " + name, "info")
+        self.notify.emit(self._tr("srvremoved", name=name), "info")
 
     @Slot(int)
     def duplicateServer(self, i: int) -> None:
@@ -530,7 +1308,7 @@ class Backend(QObject):
         s["country"] = (s.get("country", "") + " (копия)")
         servers.insert(i + 1, s)
         self._replace_group_servers(servers)
-        self.notify.emit("Дублировано · " + s["country"], "success")
+        self.notify.emit(self._tr("srvduplicated", name=s["country"]), "success")
 
     @Slot(int)
     def toggleFavorite(self, i: int) -> None:
@@ -634,13 +1412,27 @@ class Backend(QObject):
 
     def _import_text(self, text: str) -> int:
         links = [x for x in re.split(r"\s+", text or "") if x.strip()]
-        added = [self._make_server(d) for d in (self._parse_link(l) for l in links) if d]
+        parsed = [self._make_server(d) for d in (self._parse_link(l) for l in links) if d]
+        if not parsed:
+            self.notify.emit(self._tr("noLinks"), "error")
+            return 0
+        # health-check: пропускаем те, что не проходят sing-box check
+        added, skipped = [], 0
+        for srv in parsed:
+            ok, _err = self._validate_server(srv)
+            if ok:
+                added.append(srv)
+            else:
+                skipped += 1
         if not added:
-            self.notify.emit("В буфере нет валидных ссылок", "error")
+            self.notify.emit(self._tr("noneadded", n=skipped), "error")
             return 0
         servers = list(self._cur()["servers"]) + added
         self._replace_group_servers(servers)
-        self.notify.emit(f"Импортировано серверов: {len(added)}", "success")
+        if skipped:
+            self.notify.emit(self._tr("importedskip", n=len(added), skip=skipped), "info")
+        else:
+            self.notify.emit(self._tr("imported", n=len(added)), "success")
         return len(added)
 
     @Slot(result=int)
@@ -697,7 +1489,7 @@ class Backend(QObject):
     @Slot(str)
     def copyToClipboard(self, text: str) -> None:
         QApplication.clipboard().setText(text or "")
-        self.notify.emit("Скопировано", "success")
+        self.notify.emit(self._tr("copied"), "success")
 
     @Slot(int, result=str)
     def serverQr(self, i: int) -> str:
@@ -720,22 +1512,40 @@ class Backend(QObject):
 
     def _on_connected(self) -> None:
         self._set_status("connected")
-        self._ping = random.randint(34, 96)          # TODO: реальный пинг через Clash API
+        self._reconnect_attempts = 0           # успешный коннект → сбрасываем счётчик watchdog'а
+        # kill-switch: снимаем возможную блокировку, оставшуюся от предыдущего обрыва
+        try:
+            engine.firewall_unblock_all()
+        except Exception:
+            pass
+        self._ping = 0
         self._elapsed = 0
         self._down = 0.0
         self._up = 0.0
-        self._exit_ip = "%d.%d.%d.%d" % (random.randint(5, 223), random.randint(0, 255),
-                                         random.randint(0, 255), random.randint(1, 254))  # TODO: реальный IP
+        self._exit_ip = ""
+        self._tick_n = 0
+        self._base_down = 0           # базовые накопительные байты ядра на момент connect
+        self._base_up = 0
+        t = engine.clash_traffic()
+        if t:
+            self._base_down, self._base_up = t
         self.statsChanged.emit()
         self._tick.start()
         if self._mode == "proxy":
-            self._set_system_proxy(True)
-        self.notify.emit("Подключено · " + self._server, "success")
+            self._set_system_proxy(True, self._effective_port())
+        self.notify.emit(self._tr("connected", name=self._server), "success")
+        self._refresh_active_ping()                  # реальный пинг (URL-delay)
+        self._refresh_exit_ip()                      # реальный внешний IP через туннель
 
     def _disconnect(self) -> None:
         self._connect_timer.stop()
         self._core.stop()
         self._set_system_proxy(False)
+        # kill-switch: при штатном disconnect снимаем блокировку (юзер сам решил отключиться)
+        try:
+            engine.firewall_unblock_all()
+        except Exception:
+            pass
         self._tick.stop()
         self._set_status("disconnected")
         self._ping = 0
@@ -747,11 +1557,66 @@ class Backend(QObject):
 
     def _on_tick(self) -> None:
         self._elapsed += 1
-        self._down += random.uniform(0.15, 2.6)
-        self._up += random.uniform(0.05, 0.7)
-        # лёгкое дыхание пинга
-        self._ping = max(18, self._ping + random.randint(-4, 4))
+        self._tick_n += 1
+        # watchdog: если status=connected но порт ядра упал — нештатный обрыв
+        if not engine.port_listening(self._effective_port()):
+            self._handle_unexpected_drop()
+            return
+        # реальный трафик за сессию из Clash API (накопительно, МБ)
+        t = engine.clash_traffic()
+        if t:
+            self._down = max(0, t[0] - self._base_down) / 1048576.0
+            self._up = max(0, t[1] - self._base_up) / 1048576.0
+        # активный пинг (URL-delay) — раз в 5 c, чтобы не частить
+        if self._tick_n % 5 == 0:
+            self._refresh_active_ping()
         self.statsChanged.emit()
+
+    def _handle_unexpected_drop(self) -> None:
+        """Соединение оборвалось не по воле юзера. Если auto-reconnect включён и лимит попыток
+        не исчерпан — пытаемся переподключиться через 1.5с. Иначе — честный disconnect.
+        Kill-switch: при включённом тумблере немедленно блокируем весь исходящий трафик
+        через Windows Firewall, чтобы предотвратить утечки до восстановления."""
+        self._tick.stop()
+        if self._kill_switch and engine.is_admin():
+            if engine.firewall_block_all_outbound():
+                self.notify.emit(self._tr("kscut"), "error")
+        if (self._reconnect_enabled and not self._user_disconnected
+                and self._reconnect_attempts < self._RECONNECT_MAX):
+            self._reconnect_attempts += 1
+            self.notify.emit(self._tr("dropped", tries=self._reconnect_attempts, max=self._RECONNECT_MAX), "info")
+            # «мягко» останавливаем core (даже если процесс уже мёртв — безопасно), сбрасываем системный прокси
+            try:
+                self._core.stop()
+            except Exception:
+                pass
+            self._set_system_proxy(False)
+            self._set_status("disconnected")
+            QTimer.singleShot(1500, self._reconnect_now)
+        else:
+            self._disconnect()
+            if not self._user_disconnected and self._reconnect_attempts >= self._RECONNECT_MAX:
+                self.notify.emit(self._tr("dropfail"), "error")
+
+    def _reconnect_now(self) -> None:
+        """Запуск повторной попытки подключения watchdog'ом. Намерение восстановления."""
+        if self._user_disconnected or self._status != "disconnected":
+            return
+        # _user_disconnected уже False с момента _begin_connect; здесь не сбрасываем счётчик
+        srv = self._selected_server()
+        if not srv or not srv.get("address"):
+            return
+        settings = dict(self._settings)
+        settings["tun"] = (self._mode == "tun")
+        self._set_status("connecting")
+        try:
+            self._core.start(srv, settings, on_log=self._logLine.emit)
+        except Exception as e:
+            self._set_status("disconnected")
+            self.notify.emit(self._tr("reconnectfail", err=str(e)[:80]), "error")
+            return
+        self._conn_tries = 0
+        self._connect_timer.start()
 
 
 class HotkeyManager(QAbstractNativeEventFilter):
@@ -798,6 +1663,52 @@ class HotkeyManager(QAbstractNativeEventFilter):
         return False, 0
 
 
+def _windows_uses_light_theme() -> bool:
+    """Текущая системная тема Windows = light. Через HKCU\\...\\Personalize\\SystemUsesLightTheme."""
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+            0, winreg.KEY_READ)
+        try:
+            val, _ = winreg.QueryValueEx(key, "SystemUsesLightTheme")
+            return bool(val)
+        except FileNotFoundError:
+            return False
+        finally:
+            winreg.CloseKey(key)
+    except Exception:
+        return False
+
+
+def _adapt_tray_icon(path: str, light: bool) -> QIcon:
+    """На светлой теме: добавляем тонкий белый ореол вокруг непрозрачного силуэта,
+    чтобы тёмные пиксели иконки не сливались с белой панелью задач. На тёмной — оригинал."""
+    if not light:
+        return QIcon(path)
+    pix = QPixmap(path)
+    if pix.isNull():
+        return QIcon(path)
+    # маска: где у иконки альфа > 0 — закрашиваем белым (200/255 прозрачности)
+    shadow = QPixmap(pix.size())
+    shadow.fill(Qt.transparent)
+    sp = QPainter(shadow)
+    sp.drawPixmap(0, 0, pix)
+    sp.setCompositionMode(QPainter.CompositionMode_SourceIn)
+    sp.fillRect(shadow.rect(), QColor(255, 255, 255, 220))
+    sp.end()
+    # композим: маска смещённая в 8 направлениях + поверх оригинал
+    out = QPixmap(pix.size())
+    out.fill(Qt.transparent)
+    op = QPainter(out)
+    for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1),
+                   (-1, -1), (1, 1), (1, -1), (-1, 1)]:
+        op.drawPixmap(dx, dy, shadow)
+    op.drawPixmap(0, 0, pix)
+    op.end()
+    return QIcon(out)
+
+
 class AppController(QObject):
     """Трей + жизненный цикл UI. В трее QML-сцена полностью выгружается,
     остаётся только «движок» (backend) и иконка — чтобы не нагружать комп."""
@@ -810,12 +1721,14 @@ class AppController(QObject):
         self._engine = None
         self._snap = None   # снимок QML-настроек, переживает выгрузку UI
 
-        # кадры анимации трея: f00 = выглядывает (подключено) … fN = спрятан (отключено)
+        # кадры анимации трея: f00 = выглядывает (подключено) … fN = спрятан (отключено).
+        # На светлой теме Windows добавляем белый ореол, чтобы тёмные пиксели иконки не сливались с панелью задач.
         tray_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "tray")
+        light_theme = _windows_uses_light_theme()
         self._frames = []
         i = 0
         while os.path.exists(os.path.join(tray_dir, f"f{i:02d}.png")):
-            self._frames.append(QIcon(os.path.join(tray_dir, f"f{i:02d}.png")))
+            self._frames.append(_adapt_tray_icon(os.path.join(tray_dir, f"f{i:02d}.png"), light_theme))
             i += 1
         self._nframes = len(self._frames)
         self._frame_idx = (self._nframes - 1) if self._nframes else 0   # старт — спрятан
@@ -940,6 +1853,7 @@ class AppController(QObject):
             if roots:
                 QMetaObject.invokeMethod(roots[0], "exportSettings")
                 self._snap = roots[0].property("settingsSnapshot")
+                self._backend.applyConfig(self._snap)
         except Exception:
             pass
 
@@ -953,6 +1867,8 @@ class AppController(QObject):
         try:
             self._backend._core.stop()
             self._backend._set_system_proxy(False)
+            # КРИТИЧНО: снимаем kill-switch правило, иначе после quit'a юзер останется без интернета
+            engine.firewall_unblock_all()
         except Exception:
             pass
         self._tray.hide()

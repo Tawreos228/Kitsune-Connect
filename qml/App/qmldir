@@ -1,5 +1,6 @@
 module App
 singleton Theme 1.0 Theme.qml
+singleton T 1.0 T.qml
 Main 1.0 Main.qml
 ConnectButton 1.0 ConnectButton.qml
 ServerCard 1.0 ServerCard.qml
@@ -14,3 +15,4 @@ Segmented 1.0 Segmented.qml
 ValueField 1.0 ValueField.qml
 ChipRow 1.0 ChipRow.qml
 HotkeyField 1.0 HotkeyField.qml
+ThinScrollBar 1.0 ThinScrollBar.qml

@@ -32,8 +32,8 @@ Item {
             anchors.fill: parent
             Repeater {
                 model: [
-                    { k: "proxy", t: "Прокси" },
-                    { k: "tun", t: "TUN" }
+                    { k: "proxy", t: T.s("mode.proxy") },
+                    { k: "tun",   t: T.s("mode.tun") }
                 ]
                 delegate: Item {
                     id: seg
