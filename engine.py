@@ -860,15 +860,26 @@ def tcp_ping(host: str, port: int = 443, timeout: float = 2.0) -> int | None:
 
 def fetch_subscription(url: str, timeout: float = 15.0) -> str | None:
     """Загрузка тела подписки по URL. TLS без верификации (подписки часто на IP/самоподписанных
-    сертах; содержимое — просто список ссылок). None при ошибке."""
+    сертах; содержимое — просто список ссылок). None при ошибке.
+
+    Используем CookieJar: многие subscription-сервисы (FastVPN, Hiddify, и подобные) делают
+    cookie-based gating — первый запрос отдаёт 302 + Set-Cookie, и только при наличии этой куки
+    на следующем запросе отдают реальный контент. Без CookieJar получается infinite redirect loop.
+    """
     if not url:
         return None
     try:
+        import http.cookiejar
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
+        cj = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(cj),
+            urllib.request.HTTPSHandler(context=ctx),
+        )
         req = urllib.request.Request(url, headers={"User-Agent": "Kitsune/1.0"})
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+        with opener.open(req, timeout=timeout) as r:
             return r.read().decode("utf-8", "ignore")
     except Exception:
         return None
