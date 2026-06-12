@@ -31,6 +31,49 @@ from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QFileIconProvider
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
+
+
+SINGLETON_NAME = "Kitsune-Singleton-v1"
+
+
+def _focus_existing_instance() -> bool:
+    """Если уже запущенный Kitsune слушает Named Pipe — сказать ему «покажи окно» и выйти.
+    Returns True когда сообщение доставлено и второй инстанс не нужен."""
+    sock = QLocalSocket()
+    sock.connectToServer(SINGLETON_NAME)
+    if not sock.waitForConnected(500):
+        return False
+    sock.write(b"show")
+    sock.flush()
+    sock.waitForBytesWritten(500)
+    sock.disconnectFromServer()
+    return True
+
+
+class SingleInstanceServer(QObject):
+    """Named Pipe-сервер: при подключении нового инстанса эмитит showRequested."""
+    showRequested = Signal()
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        QLocalServer.removeServer(SINGLETON_NAME)  # подчищает зависший pipe после краша
+        self._srv = QLocalServer(self)
+        self._srv.newConnection.connect(self._on_new)
+        self._srv.listen(SINGLETON_NAME)
+
+    def _on_new(self) -> None:
+        c = self._srv.nextPendingConnection()
+        if c is None:
+            return
+        # данные могут уже лежать в буфере или прилететь через readyRead
+        def handle():
+            c.readAll()
+            self.showRequested.emit()
+            c.disconnectFromServer()
+        c.readyRead.connect(handle)
+        if c.bytesAvailable() > 0:
+            handle()
 
 
 class Backend(QObject):
@@ -564,14 +607,16 @@ class Backend(QObject):
         except Exception:
             pass
         try:
+            # --elevated: чтобы повышенный инстанс не упёрся в single-instance guard
+            extra = [] if "--elevated" in sys.argv else ["--elevated"]
             if getattr(sys, "frozen", False):           # собранный exe (PyInstaller)
                 exe = sys.executable
-                params = subprocess.list2cmdline(sys.argv[1:])
+                params = subprocess.list2cmdline(sys.argv[1:] + extra)
                 workdir = os.path.dirname(sys.executable)
             else:                                        # запуск через интерпретатор
                 exe = sys.executable
                 script = os.path.abspath(sys.argv[0])
-                params = subprocess.list2cmdline([script] + sys.argv[1:])
+                params = subprocess.list2cmdline([script] + sys.argv[1:] + extra)
                 workdir = os.path.dirname(script)
             r = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, workdir, 1)
             if int(r) > 32:
@@ -1934,6 +1979,11 @@ class AppController(QObject):
 
 
 def main() -> int:
+    # single-instance: вторая попытка запуска просто фокусирует уже открытое окно.
+    # --elevated пропускаем — это перезапуск через UAC, старый инстанс уже умирает.
+    if "--elevated" not in sys.argv and _focus_existing_instance():
+        return 0
+
     app = QApplication(sys.argv)
     app.setApplicationName("Kitsune")
     app.setOrganizationName("KitsuneVPN")
@@ -1949,6 +1999,11 @@ def main() -> int:
     qml_dir = Path(__file__).resolve().parent / "qml"
     ctl = AppController(app, backend, qml_dir)
     ctl.showUi()
+
+    single = SingleInstanceServer()
+    single.showRequested.connect(ctl.showUi)
+    ctl._single = single  # держим ссылку, чтобы pipe не закрылся
+
     hotkeys = HotkeyManager(backend)          # глобальный хоткей вкл/выкл
     app.installNativeEventFilter(hotkeys)
     ctl._hotkeys = hotkeys                     # держим ссылку
