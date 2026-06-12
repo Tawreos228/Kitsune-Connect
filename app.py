@@ -116,7 +116,7 @@ class Backend(QObject):
         self._up = 0.0
         self._elapsed = 0                      # секунды
         self._exit_ip = ""                     # внешний IP (мок)
-        self._mode = "proxy"                   # proxy | tun
+        self._mode = "tun"                     # proxy | tun (default: tun — auto-elevation handles UAC once)
         self._pinging = False
         self._auto_connect = True
         self._auto_connect_mode = 0            # 0 последний · 1 быстрейший
@@ -216,6 +216,9 @@ class Backend(QObject):
         srv = data.get("server")
         if isinstance(srv, str):
             self._server = srv
+        mode = data.get("mode")
+        if mode in ("proxy", "tun"):
+            self._mode = mode
         return True
 
     def _save_state(self) -> None:
@@ -226,6 +229,7 @@ class Backend(QObject):
                 "groups": self._groups,
                 "currentGroup": self._currentGroup,
                 "server": self._server,
+                "mode": self._mode,
             }
             self._state_path().write_text(
                 json.dumps(payload, ensure_ascii=False, indent=1),
@@ -754,6 +758,7 @@ class Backend(QObject):
         if m == self._mode:
             return
         self._mode = m
+        self._save_state()        # запоминаем выбор между запусками
         self.modeChanged.emit()
         if m == "tun" and not engine.is_admin():
             self.notify.emit(self._tr("mode.tunneedadmin"), "info")
@@ -1978,10 +1983,51 @@ class AppController(QObject):
         self._app.quit()
 
 
+def _exe_and_args_for_task() -> tuple[str, str] | None:
+    """Возвращает (exe, args) для регистрации scheduled-task, либо None если путь не resolveable."""
+    if getattr(sys, "frozen", False):
+        return sys.executable, "--elevated"
+    script = os.path.abspath(sys.argv[0]) if sys.argv else ""
+    if script and os.path.exists(script):
+        return sys.executable, subprocess.list2cmdline([script, "--elevated"])
+    return None
+
+
+def _try_silent_elevate() -> bool:
+    """Если зарегистрирована scheduled-task — запустить через неё (без UAC).
+    Иначе — ShellExecute "runas" (UAC). Возвращает True если elevated-инстанс пошёл стартовать."""
+    if engine.has_elevate_task() and engine.run_elevate_task():
+        return True
+    try:
+        if getattr(sys, "frozen", False):
+            exe = sys.executable
+            params = subprocess.list2cmdline(sys.argv[1:] + ["--elevated"])
+            workdir = os.path.dirname(sys.executable)
+        else:
+            exe = sys.executable
+            script = os.path.abspath(sys.argv[0])
+            params = subprocess.list2cmdline([script] + sys.argv[1:] + ["--elevated"])
+            workdir = os.path.dirname(script)
+        r = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, workdir, 1)
+        return int(r) > 32
+    except Exception:
+        return False
+
+
 def main() -> int:
     # single-instance: вторая попытка запуска просто фокусирует уже открытое окно.
     # --elevated пропускаем — это перезапуск через UAC, старый инстанс уже умирает.
     if "--elevated" not in sys.argv and _focus_existing_instance():
+        return 0
+
+    # Auto-elevation: один раз спросили UAC, дальше через scheduled-task без вопросов.
+    # --no-elevate — escape hatch для dev / тестирования non-admin поведения.
+    if (
+        "--elevated" not in sys.argv
+        and "--no-elevate" not in sys.argv
+        and not engine.is_admin()
+        and _try_silent_elevate()
+    ):
         return 0
 
     app = QApplication(sys.argv)
@@ -2008,6 +2054,13 @@ def main() -> int:
     app.installNativeEventFilter(hotkeys)
     ctl._hotkeys = hotkeys                     # держим ссылку
     QTimer.singleShot(400, backend.startup)  # авто-пинг + автоподключение на старте
+
+    # один раз elevated — закрепляем silent re-elevation на будущее
+    if engine.is_admin() and not engine.has_elevate_task():
+        spec = _exe_and_args_for_task()
+        if spec is not None:
+            engine.install_elevate_task(spec[0], spec[1])
+
     return app.exec()
 
 

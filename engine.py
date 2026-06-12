@@ -794,6 +794,78 @@ def is_admin() -> bool:
         return False
 
 
+# ---- Windows Task Scheduler: one-time UAC consent, then silent re-elevation ----
+ELEVATE_TASK_NAME = "Kitsune\\AutoElevate"
+
+
+def _schtasks(*args: str) -> int:
+    """Запуск schtasks.exe без появления окна, возвращает returncode."""
+    flags = 0x08000000 if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+    try:
+        return subprocess.run(["schtasks", *args], capture_output=True,
+                              creationflags=flags, timeout=10).returncode
+    except Exception:
+        return 1
+
+
+def has_elevate_task() -> bool:
+    """True если задача Kitsune\\AutoElevate уже зарегистрирована."""
+    return _schtasks("/query", "/tn", ELEVATE_TASK_NAME) == 0
+
+
+def install_elevate_task(command: str, arguments: str = "") -> bool:
+    """Создаёт скрытую on-demand задачу с RunLevel=HighestAvailable.
+    Требует, чтобы текущий процесс был elevated (иначе schtasks не позволит RunLevel)."""
+    # XML-описание гибче чем флаги schtasks: позволяет AllowStartOnDemand + Hidden + HighestAvailable.
+    cmd_xml = command.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    arg_xml = arguments.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    xml = (
+        '<?xml version="1.0" encoding="UTF-16"?>'
+        '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+        '<RegistrationInfo><Description>Launch Kitsune with admin rights without UAC prompt.</Description></RegistrationInfo>'
+        '<Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>'
+        '<Settings>'
+        '<MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>'
+        '<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>'
+        '<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>'
+        '<AllowHardTerminate>true</AllowHardTerminate>'
+        '<StartWhenAvailable>false</StartWhenAvailable>'
+        '<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>'
+        '<AllowStartOnDemand>true</AllowStartOnDemand>'
+        '<Enabled>true</Enabled>'
+        '<Hidden>true</Hidden>'
+        '<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>'
+        '<Priority>5</Priority>'
+        '</Settings>'
+        '<Actions Context="Author"><Exec>'
+        f'<Command>{cmd_xml}</Command>'
+        f'<Arguments>{arg_xml}</Arguments>'
+        '</Exec></Actions>'
+        '</Task>'
+    )
+    try:
+        fd, path = tempfile.mkstemp(suffix=".xml", prefix="kitsune_task_")
+        os.close(fd)
+        Path(path).write_text(xml, encoding="utf-16")
+    except Exception:
+        return False
+    try:
+        return _schtasks("/create", "/tn", ELEVATE_TASK_NAME, "/xml", path, "/f") == 0
+    finally:
+        try: os.unlink(path)
+        except Exception: pass
+
+
+def run_elevate_task() -> bool:
+    """Запускает зарегистрированную задачу — Windows поднимет процесс уже elevated, без UAC."""
+    return _schtasks("/run", "/tn", ELEVATE_TASK_NAME) == 0
+
+
+def uninstall_elevate_task() -> bool:
+    """Удаляет задачу — следующие старты пойдут через UAC как раньше."""
+    return _schtasks("/delete", "/tn", ELEVATE_TASK_NAME, "/f") == 0
+
+
 def port_listening(port: int = MIXED_PORT, host: str = "127.0.0.1") -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(0.3)
