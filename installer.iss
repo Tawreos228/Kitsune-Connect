@@ -3,7 +3,7 @@
 ; На выходе: dist_installer\KitsuneSetup.exe
 
 #define MyAppName "Kitsune"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.1.2"
 #define MyAppPublisher "Kitsune Project"
 #define MyAppURL "https://github.com/Tawreos228/KitsuneVPN"
 #define MyAppExeName "Kitsune.exe"
