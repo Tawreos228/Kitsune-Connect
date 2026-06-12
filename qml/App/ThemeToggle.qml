@@ -132,45 +132,52 @@ Item {
                     ctx.clearRect(0, 0, width, height)
                     var orange = "#FF7A2F"
                     var pink   = "#FFB1A8"
-                    var white  = "#FFF6E8"
+                    var white  = "#FFF1E0"
                     var black  = "#15171C"
 
-                    // уши (треугольники)
+                    // Большие острые уши — главный признак лисы.
+                    // Каждое ухо: от вершины снаружи к внутреннему углу у глаза.
                     ctx.fillStyle = orange
                     ctx.beginPath()
-                    ctx.moveTo(2, 3); ctx.lineTo(8, 3); ctx.lineTo(6, 10); ctx.closePath(); ctx.fill()
+                    ctx.moveTo(1, 1); ctx.lineTo(10, 9); ctx.lineTo(1, 10)
+                    ctx.closePath(); ctx.fill()
                     ctx.beginPath()
-                    ctx.moveTo(16, 3); ctx.lineTo(22, 3); ctx.lineTo(18, 10); ctx.closePath(); ctx.fill()
-
-                    // внутренние уши (розовые)
-                    ctx.fillStyle = pink
-                    ctx.beginPath()
-                    ctx.moveTo(3.5, 4); ctx.lineTo(7, 4); ctx.lineTo(6, 8); ctx.closePath(); ctx.fill()
-                    ctx.beginPath()
-                    ctx.moveTo(17, 4); ctx.lineTo(20.5, 4); ctx.lineTo(18, 8); ctx.closePath(); ctx.fill()
-
-                    // лицо — закруглённый ромб
-                    ctx.fillStyle = orange
-                    ctx.beginPath()
-                    ctx.moveTo(3, 10)
-                    ctx.bezierCurveTo(3, 7.5, 6, 6, 12, 6)
-                    ctx.bezierCurveTo(18, 6, 21, 7.5, 21, 10)
-                    ctx.bezierCurveTo(21, 16.5, 18, 21, 12, 21)
-                    ctx.bezierCurveTo(6, 21, 3, 16.5, 3, 10)
+                    ctx.moveTo(23, 1); ctx.lineTo(14, 9); ctx.lineTo(23, 10)
                     ctx.closePath(); ctx.fill()
 
-                    // светлые щёки/морда — две перекрывающиеся окружности
+                    // Морда — треугольник с пиком вниз (а не круг, как у собаки).
+                    ctx.beginPath()
+                    ctx.moveTo(1, 9)
+                    ctx.lineTo(23, 9)
+                    ctx.bezierCurveTo(22, 18, 17, 23, 12, 23)
+                    ctx.bezierCurveTo(7, 23, 2, 18, 1, 9)
+                    ctx.closePath(); ctx.fill()
+
+                    // Розовые внутренние уши.
+                    ctx.fillStyle = pink
+                    ctx.beginPath()
+                    ctx.moveTo(3, 3); ctx.lineTo(8.5, 8); ctx.lineTo(3, 8.5)
+                    ctx.closePath(); ctx.fill()
+                    ctx.beginPath()
+                    ctx.moveTo(21, 3); ctx.lineTo(15.5, 8); ctx.lineTo(21, 8.5)
+                    ctx.closePath(); ctx.fill()
+
+                    // Светлая «маска» — от середины лица к подбородку (треугольная, под цвет морды).
                     ctx.fillStyle = white
-                    ctx.beginPath(); ctx.arc(8.5, 16, 4.5, 0, 6.283); ctx.fill()
-                    ctx.beginPath(); ctx.arc(15.5, 16, 4.5, 0, 6.283); ctx.fill()
+                    ctx.beginPath()
+                    ctx.moveTo(5, 13)
+                    ctx.lineTo(19, 13)
+                    ctx.bezierCurveTo(18, 19, 14, 23, 12, 23)
+                    ctx.bezierCurveTo(10, 23, 6, 19, 5, 13)
+                    ctx.closePath(); ctx.fill()
 
-                    // глаза
+                    // Узкие тёмные глаза — в оранжевой зоне над маской.
                     ctx.fillStyle = black
-                    ctx.beginPath(); ctx.arc(8.5, 12, 1.4, 0, 6.283); ctx.fill()
-                    ctx.beginPath(); ctx.arc(15.5, 12, 1.4, 0, 6.283); ctx.fill()
+                    ctx.beginPath(); ctx.arc(8, 11.5, 1.4, 0, 6.283); ctx.fill()
+                    ctx.beginPath(); ctx.arc(16, 11.5, 1.4, 0, 6.283); ctx.fill()
 
-                    // нос
-                    ctx.beginPath(); ctx.arc(12, 16, 1.1, 0, 6.283); ctx.fill()
+                    // Нос — в светлой зоне, ближе к кончику морды.
+                    ctx.beginPath(); ctx.arc(12, 17, 1.2, 0, 6.283); ctx.fill()
                 }
             }
         }
