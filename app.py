@@ -102,6 +102,9 @@ class Backend(QObject):
     coreInfoChanged = Signal()
     _coreCheckDone = Signal("QVariantMap")
     _coreUpdateDone = Signal(bool, str)
+    appInfoChanged = Signal()
+    _appCheckDone = Signal("QVariantMap")
+    _appUpdateDone = Signal(bool, str)
     appsChanged = Signal()
     _appsScanDone = Signal("QVariantList")
     rulesImported = Signal("QVariantList", str)     # (rules, format)
@@ -173,6 +176,12 @@ class Backend(QObject):
         self._core_updating = False
         self._coreCheckDone.connect(self._on_core_check_done)
         self._coreUpdateDone.connect(self._on_core_update_done)
+        self._app_version = engine.APP_VERSION
+        self._app_latest = ""
+        self._app_latest_url = ""
+        self._app_updating = False
+        self._appCheckDone.connect(self._on_app_check_done)
+        self._appUpdateDone.connect(self._on_app_update_done)
         self._app_list: list = []                    # установленные приложения с иконками (объединённое: scan + custom)
         self._scanned_apps_raw: list = []            # сырой результат последнего scanApps() (без иконок)
         self._custom_apps_raw: list = []             # пользовательские (добавленные вручную через файл-пикер)
@@ -262,6 +271,11 @@ class Backend(QObject):
             "coreloading":       "Загрузка обновления ядра…",
             "coreupdated":       "Ядро обновлено · {ver}",
             "coreupdfail":       "Не удалось обновить · {err}",
+            "appavail":          "Доступна новая версия Kitsune · {tag}",
+            "appuptodate":       "Установлена актуальная версия Kitsune · {ver}",
+            "apploading":        "Загрузка обновления Kitsune…",
+            "appupdating":       "Запуск установщика — приложение закроется",
+            "appupdfail":        "Не удалось обновить Kitsune · {err}",
             "autostarton":       "Автозапуск включён",
             "autostartoff":      "Автозапуск выключен",
             "autostartfail":     "Не удалось изменить автозапуск · {err}",
@@ -318,6 +332,11 @@ class Backend(QObject):
             "coreloading":       "Downloading core update…",
             "coreupdated":       "Core updated · {ver}",
             "coreupdfail":       "Update failed · {err}",
+            "appavail":          "New Kitsune version available · {tag}",
+            "appuptodate":       "Kitsune is up to date · {ver}",
+            "apploading":        "Downloading Kitsune update…",
+            "appupdating":       "Launching installer — app will close",
+            "appupdfail":        "Kitsune update failed · {err}",
             "autostarton":       "Autostart enabled",
             "autostartoff":      "Autostart disabled",
             "autostartfail":     "Failed to change autostart · {err}",
@@ -936,6 +955,81 @@ class Backend(QObject):
         else:
             self.notify.emit(self._tr("coreupdfail", err=msg), "error")
         self.coreInfoChanged.emit()
+
+    # ---- авто-обновление самого приложения Kitsune ----
+    def _get_app_version(self) -> str: return self._app_version
+    def _get_app_latest(self) -> str:  return self._app_latest
+    def _get_app_updating(self) -> bool: return self._app_updating
+    def _get_app_has_update(self) -> bool:
+        return bool(self._app_latest) and bool(self._app_version) and self._app_latest != self._app_version
+
+    appVersion         = Property(str,  _get_app_version, notify=appInfoChanged)
+    appLatest          = Property(str,  _get_app_latest,  notify=appInfoChanged)
+    appUpdateAvailable = Property(bool, _get_app_has_update, notify=appInfoChanged)
+    appUpdating        = Property(bool, _get_app_updating, notify=appInfoChanged)
+
+    @Slot()
+    def checkAppUpdate(self) -> None:
+        """Тихая проверка обновлений приложения (на старте): тост только при находке."""
+        self._next_app_check_silent = True
+        self._launch_app_check()
+
+    @Slot()
+    def checkAppUpdateForce(self) -> None:
+        """Ручная проверка из UI: тост в обе стороны (есть/нет апдейта)."""
+        self._next_app_check_silent = False
+        self._launch_app_check()
+
+    def _launch_app_check(self) -> None:
+        def work() -> None:
+            rel = engine.latest_kitsune_release()
+            self._appCheckDone.emit({
+                "tag": (rel or {}).get("tag", ""),
+                "url": (rel or {}).get("setup_url", ""),
+            })
+        threading.Thread(target=work, daemon=True).start()
+
+    @Slot("QVariantMap")
+    def _on_app_check_done(self, d: dict) -> None:
+        tag = (d.get("tag") or "").strip()
+        self._app_latest = tag
+        self._app_latest_url = d.get("url") or ""
+        self.appInfoChanged.emit()
+        if self._get_app_has_update():
+            self.notify.emit(self._tr("appavail", tag=tag), "info")
+        elif not getattr(self, "_next_app_check_silent", True):
+            self.notify.emit(self._tr("appuptodate", ver=(self._app_version or "—")), "success")
+
+    @Slot()
+    def updateApp(self) -> None:
+        """Скачать и запустить новый KitsuneSetup.exe (требует disconnect, как и core-update)."""
+        if self._status != "disconnected":
+            self.notify.emit(self._tr("disconnectfirst"), "error")
+            return
+        url = getattr(self, "_app_latest_url", "")
+        if not url:
+            self.notify.emit(self._tr("norelease"), "error")
+            return
+        self._app_updating = True
+        self.appInfoChanged.emit()
+        self.notify.emit(self._tr("apploading"), "info")
+
+        def work() -> None:
+            ok, msg = engine.download_and_run_installer(url)
+            self._appUpdateDone.emit(ok, msg)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    @Slot(bool, str)
+    def _on_app_update_done(self, ok: bool, msg: str) -> None:
+        self._app_updating = False
+        self.appInfoChanged.emit()
+        if ok:
+            # installer запущен — корректно завершаемся, чтобы он мог заменить файлы
+            self.notify.emit(self._tr("appupdating"), "success")
+            QTimer.singleShot(800, QApplication.instance().quit)
+        else:
+            self.notify.emit(self._tr("appupdfail", err=msg), "error")
 
     @Slot(str)
     def openUrl(self, url: str) -> None:

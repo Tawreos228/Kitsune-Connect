@@ -351,6 +351,7 @@ ApplicationWindow {
         syncConfig()
         if (backend) {
             backend.checkCoreUpdate()
+            backend.checkAppUpdate()
             backend.scanApps()
             setAutostart = backend.isAutostartEnabled()   // синк UI-тумблера с реальным состоянием реестра
             backend.setReconnectEnabled(setReconnect)     // прокинуть начальное значение watchdog'а
@@ -1245,6 +1246,42 @@ ApplicationWindow {
                                 Layout.fillWidth: true
                                 glyph: win.icoTray; label: T.s("set.tray"); sub: T.s("set.tray.sub")
                                 control: Toggle { checked: win.setTray; onToggled: win.setTray = value }
+                            }
+                        }
+                    }
+
+                    // === ПРИЛОЖЕНИЕ (Kitsune) — версия + автообнова ===
+                    Text { text: T.s("sec.app"); color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold; font.letterSpacing: 1; Layout.topMargin: 8 }
+                    Rectangle {
+                        Layout.fillWidth: true; radius: Theme.radius; color: Theme.surface; border.width: 1; border.color: Theme.stroke
+                        implicitHeight: appCol.implicitHeight
+                        ColumnLayout {
+                            id: appCol; width: parent.width; spacing: 0
+                            SettingRow {
+                                Layout.fillWidth: true
+                                glyph: win.icoReconnect
+                                label: "Kitsune"
+                                sub: ("v" + backend.appVersion) +
+                                     (backend.appLatest && backend.appLatest !== backend.appVersion
+                                          ? "  ·  " + T.s("misc.available") + ": v" + backend.appLatest
+                                          : "")
+                                control: Rectangle {
+                                    visible: backend.appUpdateAvailable
+                                    width: 110; height: 32; radius: 9
+                                    color: backend.appUpdating
+                                        ? Qt.rgba(0,0,0,0)
+                                        : (updAppHover.hovered ? Theme.accentSoft : "transparent")
+                                    border.width: 1
+                                    border.color: backend.appUpdating ? Theme.stroke : Theme.accent
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: backend.appUpdating ? T.s("sub.loading") : T.s("sub.update")
+                                        color: backend.appUpdating ? Theme.textSub : Theme.accent
+                                        font.family: Theme.fontFamily; font.pixelSize: 13; font.weight: Font.DemiBold
+                                    }
+                                    HoverHandler { id: updAppHover; enabled: !backend.appUpdating; cursorShape: Qt.PointingHandCursor }
+                                    TapHandler { enabled: !backend.appUpdating; onTapped: backend.updateApp() }
+                                }
                             }
                         }
                     }

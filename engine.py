@@ -40,6 +40,10 @@ CLASH_PORT = 9090
 PROXY_TAG = "proxy"
 _GH_SINGBOX_API = "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
 _GH_NEKORAY_API = "https://api.github.com/repos/MatsuriDayo/nekoray/releases/latest"
+_GH_KITSUNE_API = "https://api.github.com/repos/Tawreos228/KitsuneVPN/releases/latest"
+
+# Версия приложения — синхронизировать с installer.iss MyAppVersion перед каждым релизом.
+APP_VERSION = "0.1.2"
 
 # базы для bundled-подобных rule-set'ов (тянутся ядром по требованию)
 _GEOSITE_URL = "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-{}.srs"
@@ -487,6 +491,53 @@ def latest_nekoray_release() -> dict | None:
     return {"tag": data.get("tag_name") or "",
             "url": data.get("html_url"),
             "name": data.get("name")}
+
+
+def latest_kitsune_release() -> dict | None:
+    """{tag, setup_url, setup_size, notes_url} последнего релиза KitsuneVPN.
+    Берёт первый asset, заканчивающийся на KitsuneSetup.exe (фиксированное имя в installer.iss)."""
+    data = _github_latest(_GH_KITSUNE_API)
+    if not isinstance(data, dict):
+        return None
+    tag = (data.get("tag_name") or "").lstrip("v")    # "v0.1.2" → "0.1.2"
+    setup_url = ""
+    setup_size = 0
+    for asset in data.get("assets") or []:
+        name = (asset.get("name") or "").lower()
+        if name.endswith("kitsunesetup.exe"):
+            setup_url = asset.get("browser_download_url") or ""
+            setup_size = int(asset.get("size") or 0)
+            break
+    return {"tag": tag, "setup_url": setup_url, "setup_size": setup_size,
+            "notes_url": data.get("html_url") or ""}
+
+
+def download_and_run_installer(url: str) -> tuple[bool, str]:
+    """Скачивает KitsuneSetup.exe в %TEMP% и запускает его.
+    Возвращает (ok, msg). Caller должен вскоре завершить процесс — installer закроет старый."""
+    if not url:
+        return False, "пустой url"
+    try:
+        tmp_dir = Path(tempfile.gettempdir())
+        # уникальное имя, чтобы старый файл не залочил/не запутался с антивирусом
+        dest = tmp_dir / f"Kitsune-update-{int(time.time())}.exe"
+        with urllib.request.urlopen(url, timeout=180) as r:
+            blob = r.read()
+        dest.write_bytes(blob)
+    except Exception as e:
+        return False, f"загрузка: {e}"
+    try:
+        # /SILENT — Inno Setup тихий режим: показ окна прогресса, без вопросов;
+        # /CLOSEAPPLICATIONS — закрыть запущенный Kitsune, /RESTARTAPPLICATIONS — запустить после.
+        import ctypes
+        r = ctypes.windll.shell32.ShellExecuteW(
+            None, "open", str(dest), "/SILENT /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS",
+            str(tmp_dir), 1)
+        if int(r) <= 32:
+            return False, f"ShellExecute={int(r)}"
+    except Exception as e:
+        return False, f"запуск: {e}"
+    return True, str(dest)
 
 
 def install_core_update(url: str, dest_exe: str = "sing-box.exe") -> tuple[bool, str]:

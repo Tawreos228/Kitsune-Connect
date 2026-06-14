@@ -76,6 +76,7 @@ QtObject {
             // ── секции Settings ──
             "sec.language":      "ЯЗЫК",
             "sec.interface":     "ИНТЕРФЕЙС",
+            "sec.app":           "ПРИЛОЖЕНИЕ",
             "sec.core":          "ЯДРО",
             "sec.subscription":  "ПОДПИСКА",
             "sec.connection":    "ПОДКЛЮЧЕНИЕ",
@@ -340,6 +341,7 @@ QtObject {
 
             "sec.language":      "LANGUAGE",
             "sec.interface":     "INTERFACE",
+            "sec.app":           "APP",
             "sec.core":          "CORE",
             "sec.subscription":  "SUBSCRIPTION",
             "sec.connection":    "CONNECTION",
