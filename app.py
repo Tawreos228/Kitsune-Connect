@@ -1448,11 +1448,15 @@ class Backend(QObject):
             self._sub_auto_timer.start()
 
     def _auto_refresh_all_subs(self) -> None:
-        """Тик авто-таймера: запускаем _refresh_subscription для каждой группы с URL.
-        Ручные группы (manual) — игнорируем, обновлять там нечего."""
+        """Тик авто-таймера: refresh каждой группы у которой есть URL и включён персональный
+        флаг auto (тоггл «Авто» на странице «Локации» возле подписки).
+        Ручные группы пропускаем — там обновлять нечего."""
         for i, g in enumerate(self._groups):
-            if g.get("url"):
-                self._refresh_subscription(i)
+            if not g.get("url"):
+                continue
+            if g.get("auto") is False:    # явно выключенный per-sub флаг
+                continue
+            self._refresh_subscription(i)
 
     # ---- сервера (профили) ----
     _PROFILE_KEYS = ["protocol", "address", "port", "uuid", "password", "method",
