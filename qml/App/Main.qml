@@ -654,15 +654,39 @@ ApplicationWindow {
                                         Behavior on color { ColorAnimation { duration: Theme.durBase } }
                                     }
                                     Item { Layout.fillWidth: true }
-                                    // деликатная точка — апдейт ядра доступен (видна только на Settings)
-                                    Rectangle {
-                                        visible: navItem.modelData.key === "nav.settings" && backend.coreUpdateAvailable
-                                        width: 7; height: 7; radius: 3.5
-                                        color: Theme.accent
+                                    // Индикатор обновлений (видна только на Settings).
+                                    // Сама точка + пульсирующее «эхо» вокруг неё — мягко зовёт юзера зайти.
+                                    Item {
+                                        id: updDot
+                                        readonly property bool hasUpdate: navItem.modelData.key === "nav.settings"
+                                            && (backend.coreUpdateAvailable || backend.appUpdateAvailable)
+                                        width: 14; height: 14
                                         Layout.alignment: Qt.AlignVCenter
                                         Layout.rightMargin: 2
-                                        opacity: visible ? 1 : 0
+                                        opacity: hasUpdate ? 1 : 0
                                         Behavior on opacity { NumberAnimation { duration: Theme.durBase } }
+                                        // расходящаяся волна
+                                        Rectangle {
+                                            anchors.centerIn: parent
+                                            width: 7 * pulse; height: 7 * pulse; radius: width / 2
+                                            color: "transparent"
+                                            border.color: Theme.accent
+                                            border.width: 1
+                                            opacity: Math.max(0, 1.4 - pulse * 0.7)
+                                            property real pulse: 1
+                                            SequentialAnimation on pulse {
+                                                running: updDot.hasUpdate
+                                                loops: Animation.Infinite
+                                                NumberAnimation { from: 1; to: 2.4; duration: 1300; easing.type: Easing.OutQuad }
+                                                PauseAnimation { duration: 200 }
+                                            }
+                                        }
+                                        // ядро-точка
+                                        Rectangle {
+                                            anchors.centerIn: parent
+                                            width: 7; height: 7; radius: 3.5
+                                            color: Theme.accent
+                                        }
                                     }
                                 }
 
@@ -1266,17 +1290,37 @@ ApplicationWindow {
                                           ? "  ·  " + T.s("misc.available") + ": v" + backend.appLatest
                                           : "")
                                 control: Rectangle {
+                                    id: updAppCtl
                                     visible: backend.appUpdateAvailable
-                                    width: 110; height: 32; radius: 9
-                                    color: backend.appUpdating
-                                        ? Qt.rgba(0,0,0,0)
-                                        : (updAppHover.hovered ? Theme.accentSoft : "transparent")
+                                    // во время загрузки шире — чтобы прогресс читался
+                                    width: backend.appUpdating ? 220 : 110
+                                    Behavior on width { NumberAnimation { duration: Theme.durBase; easing.type: Easing.OutCubic } }
+                                    height: 32; radius: 9
+                                    color: backend.appUpdating ? Theme.surfaceAlt
+                                         : (updAppHover.hovered ? Theme.accentSoft : "transparent")
+                                    Behavior on color { ColorAnimation { duration: Theme.durBase } }
                                     border.width: 1
                                     border.color: backend.appUpdating ? Theme.stroke : Theme.accent
+
+                                    // заливка прогресса
+                                    Rectangle {
+                                        anchors.left: parent.left; anchors.top: parent.top; anchors.bottom: parent.bottom
+                                        anchors.margins: 1
+                                        width: (parent.width - 2) * backend.appUpdateProgress
+                                        radius: parent.radius - 1
+                                        color: Theme.accent
+                                        opacity: backend.appUpdating ? 0.85 : 0
+                                        Behavior on width { NumberAnimation { duration: 160; easing.type: Easing.OutCubic } }
+                                        Behavior on opacity { NumberAnimation { duration: Theme.durBase } }
+                                    }
                                     Text {
                                         anchors.centerIn: parent
-                                        text: backend.appUpdating ? T.s("sub.loading") : T.s("sub.update")
-                                        color: backend.appUpdating ? Theme.textSub : Theme.accent
+                                        text: backend.appUpdating
+                                            ? Math.round(backend.appUpdateProgress * 100) + "%"
+                                            : T.s("sub.update")
+                                        color: backend.appUpdating
+                                            ? (backend.appUpdateProgress > 0.5 ? "white" : Theme.text)
+                                            : Theme.accent
                                         font.family: Theme.fontFamily; font.pixelSize: 13; font.weight: Font.DemiBold
                                     }
                                     HoverHandler { id: updAppHover; enabled: !backend.appUpdating; cursorShape: Qt.PointingHandCursor }
@@ -1302,17 +1346,35 @@ ApplicationWindow {
                                 sub: (backend.coreVersion || T.s("sub.notinstalled")) +
                                      (backend.coreLatest ? "  ·  " + T.s("misc.available") + ": " + backend.coreLatest : "")
                                 control: Rectangle {
+                                    id: updCoreCtl
                                     visible: backend.coreUpdateAvailable
-                                    width: 110; height: 32; radius: 9
-                                    color: backend.coreUpdating
-                                        ? Qt.rgba(0,0,0,0)
-                                        : (updCoreHover.hovered ? Theme.accentSoft : "transparent")
+                                    width: backend.coreUpdating ? 220 : 110
+                                    Behavior on width { NumberAnimation { duration: Theme.durBase; easing.type: Easing.OutCubic } }
+                                    height: 32; radius: 9
+                                    color: backend.coreUpdating ? Theme.surfaceAlt
+                                         : (updCoreHover.hovered ? Theme.accentSoft : "transparent")
+                                    Behavior on color { ColorAnimation { duration: Theme.durBase } }
                                     border.width: 1
                                     border.color: backend.coreUpdating ? Theme.stroke : Theme.accent
+
+                                    Rectangle {
+                                        anchors.left: parent.left; anchors.top: parent.top; anchors.bottom: parent.bottom
+                                        anchors.margins: 1
+                                        width: (parent.width - 2) * backend.coreUpdateProgress
+                                        radius: parent.radius - 1
+                                        color: Theme.accent
+                                        opacity: backend.coreUpdating ? 0.85 : 0
+                                        Behavior on width { NumberAnimation { duration: 160; easing.type: Easing.OutCubic } }
+                                        Behavior on opacity { NumberAnimation { duration: Theme.durBase } }
+                                    }
                                     Text {
                                         anchors.centerIn: parent
-                                        text: backend.coreUpdating ? T.s("sub.loading") : T.s("sub.update")
-                                        color: backend.coreUpdating ? Theme.textSub : Theme.accent
+                                        text: backend.coreUpdating
+                                            ? Math.round(backend.coreUpdateProgress * 100) + "%"
+                                            : T.s("sub.update")
+                                        color: backend.coreUpdating
+                                            ? (backend.coreUpdateProgress > 0.5 ? "white" : Theme.text)
+                                            : Theme.accent
                                         font.family: Theme.fontFamily; font.pixelSize: 13; font.weight: Font.DemiBold
                                     }
                                     HoverHandler { id: updCoreHover; enabled: !backend.coreUpdating; cursorShape: Qt.PointingHandCursor }

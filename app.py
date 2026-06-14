@@ -105,6 +105,8 @@ class Backend(QObject):
     appInfoChanged = Signal()
     _appCheckDone = Signal("QVariantMap")
     _appUpdateDone = Signal(bool, str)
+    _appProgress = Signal(float)
+    _coreProgress = Signal(float)
     appsChanged = Signal()
     _appsScanDone = Signal("QVariantList")
     rulesImported = Signal("QVariantList", str)     # (rules, format)
@@ -180,8 +182,12 @@ class Backend(QObject):
         self._app_latest = ""
         self._app_latest_url = ""
         self._app_updating = False
+        self._app_progress = 0.0
+        self._core_progress = 0.0
         self._appCheckDone.connect(self._on_app_check_done)
         self._appUpdateDone.connect(self._on_app_update_done)
+        self._appProgress.connect(self._on_app_progress)
+        self._coreProgress.connect(self._on_core_progress)
         self._app_list: list = []                    # установленные приложения с иконками (объединённое: scan + custom)
         self._scanned_apps_raw: list = []            # сырой результат последнего scanApps() (без иконок)
         self._custom_apps_raw: list = []             # пользовательские (добавленные вручную через файл-пикер)
@@ -937,11 +943,17 @@ class Backend(QObject):
             self.notify.emit(self._tr("norelease"), "error")
             return
         self._core_updating = True
+        self._core_progress = 0.0
         self.coreInfoChanged.emit()
         self.notify.emit(self._tr("coreloading"), "info")
 
+        sig = self._coreProgress
+        def progress(read: int, total: int) -> None:
+            if total > 0:
+                sig.emit(read / total)
+
         def work() -> None:
-            ok, msg = engine.install_core_update(url, "sing-box.exe")
+            ok, msg = engine.install_core_update(url, "sing-box.exe", on_progress=progress)
             self._coreUpdateDone.emit(ok, msg)
 
         threading.Thread(target=work, daemon=True).start()
@@ -963,10 +975,25 @@ class Backend(QObject):
     def _get_app_has_update(self) -> bool:
         return bool(self._app_latest) and bool(self._app_version) and self._app_latest != self._app_version
 
-    appVersion         = Property(str,  _get_app_version, notify=appInfoChanged)
-    appLatest          = Property(str,  _get_app_latest,  notify=appInfoChanged)
-    appUpdateAvailable = Property(bool, _get_app_has_update, notify=appInfoChanged)
-    appUpdating        = Property(bool, _get_app_updating, notify=appInfoChanged)
+    def _get_app_progress(self) -> float: return self._app_progress
+    def _get_core_progress(self) -> float: return self._core_progress
+
+    appVersion          = Property(str,  _get_app_version, notify=appInfoChanged)
+    appLatest           = Property(str,  _get_app_latest,  notify=appInfoChanged)
+    appUpdateAvailable  = Property(bool, _get_app_has_update, notify=appInfoChanged)
+    appUpdating         = Property(bool, _get_app_updating, notify=appInfoChanged)
+    appUpdateProgress   = Property(float, _get_app_progress, notify=appInfoChanged)
+    coreUpdateProgress  = Property(float, _get_core_progress, notify=coreInfoChanged)
+
+    @Slot(float)
+    def _on_app_progress(self, p: float) -> None:
+        self._app_progress = max(0.0, min(1.0, p))
+        self.appInfoChanged.emit()
+
+    @Slot(float)
+    def _on_core_progress(self, p: float) -> None:
+        self._core_progress = max(0.0, min(1.0, p))
+        self.coreInfoChanged.emit()
 
     @Slot()
     def checkAppUpdate(self) -> None:
@@ -1011,11 +1038,17 @@ class Backend(QObject):
             self.notify.emit(self._tr("norelease"), "error")
             return
         self._app_updating = True
+        self._app_progress = 0.0
         self.appInfoChanged.emit()
         self.notify.emit(self._tr("apploading"), "info")
 
+        sig = self._appProgress
+        def progress(read: int, total: int) -> None:
+            if total > 0:
+                sig.emit(read / total)
+
         def work() -> None:
-            ok, msg = engine.download_and_run_installer(url)
+            ok, msg = engine.download_and_run_installer(url, on_progress=progress)
             self._appUpdateDone.emit(ok, msg)
 
         threading.Thread(target=work, daemon=True).start()

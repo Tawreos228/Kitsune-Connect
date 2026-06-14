@@ -512,18 +512,36 @@ def latest_kitsune_release() -> dict | None:
             "notes_url": data.get("html_url") or ""}
 
 
-def download_and_run_installer(url: str) -> tuple[bool, str]:
+def _stream_download(url: str, dest: Path, on_progress=None, chunk: int = 65536) -> None:
+    """Качает url в dest потоково, дёргая on_progress(read, total) после каждого чанка."""
+    with urllib.request.urlopen(url, timeout=180) as r:
+        total = int(r.headers.get("content-length") or 0)
+        read = 0
+        with open(dest, "wb") as f:
+            while True:
+                buf = r.read(chunk)
+                if not buf:
+                    break
+                f.write(buf)
+                read += len(buf)
+                if on_progress:
+                    try:
+                        on_progress(read, total)
+                    except Exception:
+                        pass
+
+
+def download_and_run_installer(url: str, on_progress=None) -> tuple[bool, str]:
     """Скачивает KitsuneSetup.exe в %TEMP% и запускает его.
-    Возвращает (ok, msg). Caller должен вскоре завершить процесс — installer закроет старый."""
+    Возвращает (ok, msg). Caller должен вскоре завершить процесс — installer закроет старый.
+    on_progress(read, total) — колбэк прогресса (вызывается из этого же потока)."""
     if not url:
         return False, "пустой url"
     try:
         tmp_dir = Path(tempfile.gettempdir())
         # уникальное имя, чтобы старый файл не залочил/не запутался с антивирусом
         dest = tmp_dir / f"Kitsune-update-{int(time.time())}.exe"
-        with urllib.request.urlopen(url, timeout=180) as r:
-            blob = r.read()
-        dest.write_bytes(blob)
+        _stream_download(url, dest, on_progress=on_progress)
     except Exception as e:
         return False, f"загрузка: {e}"
     try:
@@ -540,15 +558,19 @@ def download_and_run_installer(url: str) -> tuple[bool, str]:
     return True, str(dest)
 
 
-def install_core_update(url: str, dest_exe: str = "sing-box.exe") -> tuple[bool, str]:
+def install_core_update(url: str, dest_exe: str = "sing-box.exe", on_progress=None) -> tuple[bool, str]:
     """Скачать zip-релиз и подменить core/<dest_exe>. (ok, message).
+    on_progress(read, total) — колбэк прогресса загрузки zip-файла.
     Если файл занят (ядро запущено) — Windows вернёт PermissionError, обработаем."""
     import io
     import zipfile
     dest = _CORE_DIR / dest_exe
     try:
-        with urllib.request.urlopen(url, timeout=180) as r:
-            blob = r.read()
+        zip_tmp = Path(tempfile.gettempdir()) / f"singbox-{int(time.time())}.zip"
+        _stream_download(url, zip_tmp, on_progress=on_progress)
+        blob = zip_tmp.read_bytes()
+        try: zip_tmp.unlink()
+        except Exception: pass
         zf = zipfile.ZipFile(io.BytesIO(blob))
         match = None
         for n in zf.namelist():
