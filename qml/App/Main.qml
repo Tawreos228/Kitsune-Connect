@@ -1025,8 +1025,35 @@ ApplicationWindow {
                             Text { text: subInfo.g.url || ""; color: Theme.text; font.family: Theme.fontFamily; font.pixelSize: 12; elide: Text.ElideMiddle; Layout.fillWidth: true }
                             Text { text: T.s("loc.updated") + (subInfo.g.updated || "—"); color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11 }
                         }
-                        Text { text: T.s("btn.auto"); color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11; Layout.alignment: Qt.AlignVCenter }
+                        // если сервер прислал свой Profile-Update-Interval — показываем badge и
+                        // прячем пользовательский тоггл «Авто»: серверный интервал перебивает выбор.
+                        Rectangle {
+                            visible: (subInfo.g.profileUpdateInterval || 0) > 0
+                            Layout.alignment: Qt.AlignVCenter
+                            implicitHeight: 24
+                            implicitWidth: subAutoLabel.implicitWidth + 16
+                            radius: 12
+                            color: Theme.accentSoft
+                            border.width: 1; border.color: Theme.accent
+                            Text {
+                                id: subAutoLabel
+                                anchors.centerIn: parent
+                                text: T.s("loc.subauto") + " " + (subInfo.g.profileUpdateInterval || 0) + T.s("misc.shorth")
+                                color: Theme.accent
+                                font.family: Theme.fontFamily; font.pixelSize: 11; font.weight: Font.DemiBold
+                            }
+                            HoverHandler { cursorShape: Qt.PointingHandCursor }
+                            ToolTip.visible: hoverEnabled && ttHover.hovered
+                            ToolTip.text: T.s("loc.subauto.tt")
+                            HoverHandler { id: ttHover }
+                        }
+                        Text {
+                            visible: !((subInfo.g.profileUpdateInterval || 0) > 0)
+                            text: T.s("btn.auto"); color: Theme.textMuted; font.family: Theme.fontFamily; font.pixelSize: 11
+                            Layout.alignment: Qt.AlignVCenter
+                        }
                         Toggle {
+                            visible: !((subInfo.g.profileUpdateInterval || 0) > 0)
                             Layout.alignment: Qt.AlignVCenter
                             implicitWidth: 40; implicitHeight: 24
                             checked: subInfo.g.auto || false

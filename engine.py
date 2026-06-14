@@ -1003,16 +1003,16 @@ def tcp_ping(host: str, port: int = 443, timeout: float = 2.0) -> int | None:
         return None
 
 
-def fetch_subscription(url: str, timeout: float = 15.0) -> str | None:
-    """Загрузка тела подписки по URL. TLS без верификации (подписки часто на IP/самоподписанных
-    сертах; содержимое — просто список ссылок). None при ошибке.
+def fetch_subscription(url: str, timeout: float = 15.0) -> tuple[str, dict] | tuple[None, dict]:
+    """Загрузка тела подписки по URL. Возвращает (body, headers) — headers — это плоский dict
+    с lower-case ключами (caller'у удобнее читать Profile-Update-Interval / Subscription-Userinfo).
+    При ошибке: (None, {}).
 
-    Используем CookieJar: многие subscription-сервисы (FastVPN, Hiddify, и подобные) делают
-    cookie-based gating — первый запрос отдаёт 302 + Set-Cookie, и только при наличии этой куки
-    на следующем запросе отдают реальный контент. Без CookieJar получается infinite redirect loop.
-    """
+    TLS без верификации (подписки часто на IP/самоподписанных сертах; содержимое — просто список
+    ссылок). Используем CookieJar — многие subscription-сервисы делают cookie-based gating
+    (302 + Set-Cookie на первом запросе, реальный контент только с куки)."""
     if not url:
-        return None
+        return None, {}
     try:
         import http.cookiejar
         ctx = ssl.create_default_context()
@@ -1025,9 +1025,25 @@ def fetch_subscription(url: str, timeout: float = 15.0) -> str | None:
         )
         req = urllib.request.Request(url, headers={"User-Agent": "Kitsune/1.0"})
         with opener.open(req, timeout=timeout) as r:
-            return r.read().decode("utf-8", "ignore")
+            body = r.read().decode("utf-8", "ignore")
+            headers = {k.lower(): v for k, v in (r.headers.items() or [])}
+            return body, headers
     except Exception:
-        return None
+        return None, {}
+
+
+def parse_profile_update_interval(headers: dict) -> int:
+    """Surge-style header Profile-Update-Interval: <hours>. Возвращает int часов (>0) или 0."""
+    try:
+        v = headers.get("profile-update-interval") if headers else None
+        if not v:
+            return 0
+        # некоторые сервера присылают "24" или "24h" или "24 hours"
+        s = str(v).strip().lower().rstrip("h").split()[0]
+        h = int(float(s))
+        return h if h > 0 else 0
+    except Exception:
+        return 0
 
 
 def exit_ip(port: int = MIXED_PORT, timeout: float = 6.0) -> str | None:

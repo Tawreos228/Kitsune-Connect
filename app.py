@@ -96,7 +96,7 @@ class Backend(QObject):
     _pingAllDone = Signal(int, "QVariantList")
     _activePingDone = Signal(int)
     _exitIpDone = Signal(str)
-    _subDone = Signal(int, "QVariantList", bool, int)   # gi, servers (валидные), fetched_ok, invalid_count
+    _subDone = Signal(int, "QVariantList", bool, int, int)   # gi, servers, ok, invalid, profile_interval_h (0 если сервер не задал)
     _logLine = Signal(str)                          # одна строка лога ядра (из фонового потока)
     logsChanged = Signal()
     coreInfoChanged = Signal()
@@ -188,13 +188,16 @@ class Backend(QObject):
         self._appUpdateDone.connect(self._on_app_update_done)
         self._appProgress.connect(self._on_app_progress)
         self._coreProgress.connect(self._on_core_progress)
-        # фоновое авто-обновление подписок: QTimer-тик каждые N часов плюс отложенный
-        # стартовый refresh, чтобы сразу подтянуть свежие сервера, не блокируя UI.
+        # Фоновое авто-обновление подписок: один scheduler-таймер с тиком в 60 сек.
+        # На каждом тике проверяет для каждой группы, пора ли её обновить (по своему
+        # Profile-Update-Interval header'у с сервера ИЛИ по глобальной настройке).
+        # Старт сразу после init — сами решения о refresh'ах принимает в _auto_refresh_all_subs.
         self._sub_auto_refresh = False
         self._sub_refresh_h = 12
         self._sub_auto_timer = QTimer(self)
-        self._sub_auto_timer.setSingleShot(False)
+        self._sub_auto_timer.setInterval(60_000)
         self._sub_auto_timer.timeout.connect(self._auto_refresh_all_subs)
+        self._sub_auto_timer.start()
         self._app_list: list = []                    # установленные приложения с иконками (объединённое: scan + custom)
         self._scanned_apps_raw: list = []            # сырой результат последнего scanApps() (без иконок)
         self._custom_apps_raw: list = []             # пользовательские (добавленные вручную через файл-пикер)
@@ -1329,7 +1332,7 @@ class Backend(QObject):
         url = self._groups[gi].get("url") or ""
 
         def work() -> None:
-            text = engine.fetch_subscription(url)
+            text, headers = engine.fetch_subscription(url)
             valid_servers: list = []
             invalid = 0
             if text:
@@ -1345,15 +1348,22 @@ class Backend(QObject):
                         valid_servers.append(srv)
                     else:
                         invalid += 1
-            self._subDone.emit(gi, valid_servers, text is not None, invalid)
+            profile_int = engine.parse_profile_update_interval(headers)
+            self._subDone.emit(gi, valid_servers, text is not None, invalid, profile_int)
 
         threading.Thread(target=work, daemon=True).start()
 
-    @Slot(int, "QVariantList", bool, int)
-    def _on_sub_done(self, gi: int, servers: list, ok: bool, invalid: int) -> None:
+    @Slot(int, "QVariantList", bool, int, int)
+    def _on_sub_done(self, gi: int, servers: list, ok: bool, invalid: int, profile_interval: int) -> None:
         if not (0 <= gi < len(self._groups)):
             return
         g = dict(self._groups[gi])
+        # сервер может прислать свой интервал автообновления в Profile-Update-Interval header'е —
+        # запоминаем (или чистим если перестал присылать).
+        if profile_interval > 0:
+            g["profileUpdateInterval"] = profile_interval
+        elif "profileUpdateInterval" in g:
+            del g["profileUpdateInterval"]
         if ok and servers:
             fav = {(s.get("address"), s.get("port"))
                    for s in g["servers"] if s.get("fav")}
@@ -1362,6 +1372,7 @@ class Backend(QObject):
                     s["fav"] = True
             g["servers"] = servers
             g["updated"] = "только что"
+            g["lastUpdatedAt"] = time.time()
             if invalid:
                 self.notify.emit(self._tr("subupdatedskip", name=g['name'], n=len(servers), skip=invalid), "info")
             else:
@@ -1427,36 +1438,41 @@ class Backend(QObject):
     # ---- фоновое авто-обновление подписок ----
     @Slot(bool)
     def setSubAutoRefresh(self, on: bool) -> None:
-        """Вкл/выкл фоновое обновление всех подписок."""
+        """Глобальный «мастер-выключатель»: используется только для подписок без своего
+        Profile-Update-Interval header'а. Подписки с серверным интервалом обновляются всегда."""
         self._sub_auto_refresh = bool(on)
-        self._restart_sub_timer()
 
     @Slot(int)
     def setSubRefreshInterval(self, hours: int) -> None:
-        """Задать интервал в часах (3 / 6 / 12 / 24 — но принимает любое положительное)."""
-        h = max(1, int(hours))
-        if h == self._sub_refresh_h:
-            return
-        self._sub_refresh_h = h
-        self._restart_sub_timer()
+        """Глобальный интервал — fallback для подписок без серверного header'а. Часы."""
+        self._sub_refresh_h = max(1, int(hours))
 
-    def _restart_sub_timer(self) -> None:
-        self._sub_auto_timer.stop()
-        if self._sub_auto_refresh and self._sub_refresh_h > 0:
-            # QTimer.setInterval принимает ms — h * 3600 * 1000
-            self._sub_auto_timer.setInterval(int(self._sub_refresh_h * 3600 * 1000))
-            self._sub_auto_timer.start()
+    def _effective_sub_interval_h(self, g: dict) -> int:
+        """Эффективный интервал refresh для группы в часах. 0 = не обновлять.
+        Приоритет: серверный Profile-Update-Interval header > глобальная настройка (+ per-sub Auto)."""
+        sub_h = int(g.get("profileUpdateInterval") or 0)
+        if sub_h > 0:
+            return sub_h
+        # без header — на усмотрение юзера
+        if not self._sub_auto_refresh:
+            return 0
+        if g.get("auto") is False:
+            return 0
+        return int(self._sub_refresh_h)
 
     def _auto_refresh_all_subs(self) -> None:
-        """Тик авто-таймера: refresh каждой группы у которой есть URL и включён персональный
-        флаг auto (тоггл «Авто» на странице «Локации» возле подписки).
-        Ручные группы пропускаем — там обновлять нечего."""
+        """Scheduler-тик (раз в 60с): для каждой группы вычисляем эффективный интервал,
+        смотрим когда был последний refresh — если пора, дёргаем _refresh_subscription."""
+        now = time.time()
         for i, g in enumerate(self._groups):
             if not g.get("url"):
                 continue
-            if g.get("auto") is False:    # явно выключенный per-sub флаг
+            eff_h = self._effective_sub_interval_h(g)
+            if eff_h <= 0:
                 continue
-            self._refresh_subscription(i)
+            last = float(g.get("lastUpdatedAt") or 0)
+            if now - last >= eff_h * 3600:
+                self._refresh_subscription(i)
 
     # ---- сервера (профили) ----
     _PROFILE_KEYS = ["protocol", "address", "port", "uuid", "password", "method",
