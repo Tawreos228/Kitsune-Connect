@@ -188,6 +188,13 @@ class Backend(QObject):
         self._appUpdateDone.connect(self._on_app_update_done)
         self._appProgress.connect(self._on_app_progress)
         self._coreProgress.connect(self._on_core_progress)
+        # фоновое авто-обновление подписок: QTimer-тик каждые N часов плюс отложенный
+        # стартовый refresh, чтобы сразу подтянуть свежие сервера, не блокируя UI.
+        self._sub_auto_refresh = False
+        self._sub_refresh_h = 12
+        self._sub_auto_timer = QTimer(self)
+        self._sub_auto_timer.setSingleShot(False)
+        self._sub_auto_timer.timeout.connect(self._auto_refresh_all_subs)
         self._app_list: list = []                    # установленные приложения с иконками (объединённое: scan + custom)
         self._scanned_apps_raw: list = []            # сырой результат последнего scanApps() (без иконок)
         self._custom_apps_raw: list = []             # пользовательские (добавленные вручную через файл-пикер)
@@ -841,6 +848,9 @@ class Backend(QObject):
         """Запуск приложения: сразу пингуем сервера, затем (опционально) автоподключение."""
         self._pending_autoconnect = self._auto_connect and self._status == "disconnected"
         self.pingAll()
+        # отложенный стартовый refresh подписок — даём UI ~30 сек подняться, потом тянем свежие
+        if self._sub_auto_refresh:
+            QTimer.singleShot(30_000, self._auto_refresh_all_subs)
 
     def _refresh_active_ping(self) -> None:
         """URL-delay активного proxy через Clash API (в потоке)."""
@@ -1413,6 +1423,36 @@ class Backend(QObject):
         self._groups = self._groups[:i] + [g] + self._groups[i + 1:]
         self.groupsChanged.emit()
         self._save_state()
+
+    # ---- фоновое авто-обновление подписок ----
+    @Slot(bool)
+    def setSubAutoRefresh(self, on: bool) -> None:
+        """Вкл/выкл фоновое обновление всех подписок."""
+        self._sub_auto_refresh = bool(on)
+        self._restart_sub_timer()
+
+    @Slot(int)
+    def setSubRefreshInterval(self, hours: int) -> None:
+        """Задать интервал в часах (3 / 6 / 12 / 24 — но принимает любое положительное)."""
+        h = max(1, int(hours))
+        if h == self._sub_refresh_h:
+            return
+        self._sub_refresh_h = h
+        self._restart_sub_timer()
+
+    def _restart_sub_timer(self) -> None:
+        self._sub_auto_timer.stop()
+        if self._sub_auto_refresh and self._sub_refresh_h > 0:
+            # QTimer.setInterval принимает ms — h * 3600 * 1000
+            self._sub_auto_timer.setInterval(int(self._sub_refresh_h * 3600 * 1000))
+            self._sub_auto_timer.start()
+
+    def _auto_refresh_all_subs(self) -> None:
+        """Тик авто-таймера: запускаем _refresh_subscription для каждой группы с URL.
+        Ручные группы (manual) — игнорируем, обновлять там нечего."""
+        for i, g in enumerate(self._groups):
+            if g.get("url"):
+                self._refresh_subscription(i)
 
     # ---- сервера (профили) ----
     _PROFILE_KEYS = ["protocol", "address", "port", "uuid", "password", "method",

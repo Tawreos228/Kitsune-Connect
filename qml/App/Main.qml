@@ -186,6 +186,9 @@ ApplicationWindow {
 
     // авто-подстройка настроек под подписку (полностью заработает с подписками)
     property bool setAutoConf: true
+    // фоновое обновление подписок (как часто Kitsune сам тянет свежие сервера)
+    property bool setSubAutoRefresh: true
+    property int  subRefreshInterval: 12     // часов · допустимо 3/6/12/24
 
     // редактор правила
     property bool ruleEditorOpen: false
@@ -286,6 +289,7 @@ ApplicationWindow {
             setTray: setTray, setLan: setLan, setStrictRoute: setStrictRoute,
             setSniff: setSniff, setFakeIp: setFakeIp, setMux: setMux, tunStack: tunStack,
             muxProto: muxProto, setAutoConf: setAutoConf,
+            setSubAutoRefresh: setSubAutoRefresh, subRefreshInterval: subRefreshInterval,
             rtProfile: rtProfile, rtLan: rtLan, rtRegionDirect: rtRegionDirect,
             rtAdblock: rtAdblock, rtProxyAll: rtProxyAll, rtFinal: rtFinal, routeRules: routeRules,
             portMixed: portMixed, mtu: mtu, dnsRemote: dnsRemote, dnsDirect: dnsDirect,
@@ -310,6 +314,8 @@ ApplicationWindow {
         if (s.tunStack !== undefined) tunStack = s.tunStack
         if (s.muxProto !== undefined) muxProto = s.muxProto
         if (s.setAutoConf !== undefined) setAutoConf = s.setAutoConf
+        if (s.setSubAutoRefresh !== undefined) setSubAutoRefresh = !!s.setSubAutoRefresh
+        if (s.subRefreshInterval !== undefined) subRefreshInterval = parseInt(s.subRefreshInterval) || 12
         if (s.rtProfile !== undefined) rtProfile = s.rtProfile
         if (s.rtLan !== undefined) rtLan = s.rtLan
         if (s.rtRegionDirect !== undefined) rtRegionDirect = s.rtRegionDirect
@@ -356,6 +362,8 @@ ApplicationWindow {
             setAutostart = backend.isAutostartEnabled()   // синк UI-тумблера с реальным состоянием реестра
             backend.setReconnectEnabled(setReconnect)     // прокинуть начальное значение watchdog'а
             backend.setKillSwitchEnabled(setKill)         // прокинуть начальное значение kill-switch
+            backend.setSubRefreshInterval(subRefreshInterval)   // порядок важен: сначала интервал
+            backend.setSubAutoRefresh(setSubAutoRefresh)        // потом включение — стартанёт timer/QTimer.singleShot уже в startup()
             backend.setLang(T.lang)                       // i18n: язык Backend-notify
         }
     }
@@ -1413,6 +1421,40 @@ ApplicationWindow {
                                 glyph: win.icoLink; label: T.s("set.autoconf")
                                 sub: T.s("set.autoconf.sub")
                                 control: Toggle { checked: win.setAutoConf; onToggled: win.setAutoConf = value }
+                            }
+                            Rectangle { Layout.fillWidth: true; Layout.leftMargin: 50; height: 1; color: Theme.stroke }
+                            SettingRow {
+                                Layout.fillWidth: true
+                                glyph: win.icoReconnect
+                                label: T.s("set.subautoref")
+                                sub: T.s("set.subautoref.sub")
+                                control: Toggle {
+                                    checked: win.setSubAutoRefresh
+                                    onToggled: {
+                                        win.setSubAutoRefresh = value
+                                        backend.setSubAutoRefresh(value)
+                                    }
+                                }
+                            }
+                            // интервал — виден только если auto-refresh включён
+                            SettingRow {
+                                Layout.fillWidth: true
+                                visible: win.setSubAutoRefresh
+                                glyph: win.icoClock
+                                label: T.s("set.subinterval")
+                                sub: T.s("set.subinterval.sub")
+                                control: Segmented {
+                                    width: 220
+                                    options: [T.s("interval.3h"), T.s("interval.6h"), T.s("interval.12h"), T.s("interval.24h")]
+                                    currentIndex: win.subRefreshInterval === 3 ? 0
+                                                : win.subRefreshInterval === 6 ? 1
+                                                : win.subRefreshInterval === 24 ? 3 : 2
+                                    onSelected: {
+                                        var h = [3, 6, 12, 24][index] || 12
+                                        win.subRefreshInterval = h
+                                        backend.setSubRefreshInterval(h)
+                                    }
+                                }
                             }
                         }
                     }
