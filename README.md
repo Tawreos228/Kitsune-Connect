@@ -7,6 +7,7 @@
 **A Windows VPN client that doesn't get in your way.**
 
 [![Latest release](https://img.shields.io/github/v/release/Tawreos228/KitsuneVPN?label=download&color=FF7A2F&style=for-the-badge)](../../releases/latest)
+[![Telegram](https://img.shields.io/badge/Telegram-@Kitsune__VPN-229ED9?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/Kitsune_VPN)
 
 [![sing-box](https://img.shields.io/badge/engine-sing--box_1.13-FF7A2F)](https://github.com/SagerNet/sing-box)
 [![Qt](https://img.shields.io/badge/UI-PySide6_%2F_QML-0A84FF)](https://doc.qt.io/qtforpython-6/)
@@ -251,6 +252,8 @@ Being honest about scope:
 
 This is an actively developing project &mdash; expect rough edges. **All feedback is welcome:**
 
+- 📣 &nbsp; **Stay in the loop** &mdash; new releases land automatically on the
+  [Telegram channel](https://t.me/Kitsune_VPN). Quickest way to be notified about hotfixes.
 - 🐞 &nbsp; **Something broken?** &mdash; [open a bug report](../../issues/new?template=bug_report.md).
   Include your Windows version, what you did, what happened, and what you expected.
 - 🤔 &nbsp; **Something behaves weirdly?** &mdash; tell us. Even if it's "this dialog felt
