@@ -142,6 +142,46 @@ No registry writes outside of the Windows Run key (only if you enable autostart 
 
 ---
 
+## Safety — verified clean
+
+Every release is uploaded to [VirusTotal](https://www.virustotal.com) so anyone can verify
+the binaries themselves, without trusting the maintainer or the GitHub download badge:
+
+<table>
+<tr>
+<td width="50%" valign="top" align="center">
+<a href="https://www.virustotal.com/gui/file/f97866fc5bb63d263f63c015e6e6fceb947f997f1b17589e74ac3896e04cec5d"><img src="docs/virustotal-portable.png" alt="VirusTotal scan — Kitsune-portable.zip"></a>
+<br><sub><b>Kitsune-portable.zip</b> &mdash; <a href="https://www.virustotal.com/gui/file/f97866fc5bb63d263f63c015e6e6fceb947f997f1b17589e74ac3896e04cec5d">0 / 64 detections</a></sub>
+</td>
+<td width="50%" valign="top" align="center">
+<a href="https://www.virustotal.com/gui/file/7a0306e2c3e65adccbfa6c4212c3f12a549b66dc623270109f94a3ff4948a02f"><img src="docs/virustotal-installer.png" alt="VirusTotal scan — KitsuneSetup.exe"></a>
+<br><sub><b>KitsuneSetup.exe</b> &mdash; <a href="https://www.virustotal.com/gui/file/7a0306e2c3e65adccbfa6c4212c3f12a549b66dc623270109f94a3ff4948a02f">2 / 67 detections</a></sub>
+</td>
+</tr>
+</table>
+
+> The two flags on the installer come from **DeepInstinct** and **Trapmine** &mdash; both are
+> deep-learning classifiers whose Trapmine result is labelled `Suspicious.low.ml.score`
+> (literally *low confidence*) and DeepInstinct has well-documented false positives on
+> any unsigned PyInstaller bundle, regardless of contents. Every name-brand engine
+> (Microsoft, Kaspersky, BitDefender, ESET, Avast, AVG, Sophos, McAfee, Symantec)
+> clears both files.
+
+You don't need to take that on faith &mdash; the VirusTotal pages are public and
+linked above; the SHA-256 of every release asset is on the GitHub Releases page so you
+can rescan yourself.
+
+### About the SmartScreen warning
+
+The current releases are **not yet code-signed**, so Windows SmartScreen will warn
+about an "unrecognised app" on first install for new users. This is reputation-based,
+not a virus detection &mdash; click **More info &rarr; Run anyway** to proceed.
+Users already on a previous Kitsune install upgrade silently via the in-app
+self-updater and don't see this warning. A code-signing certificate is on the
+roadmap once the user base grows enough to justify the cost.
+
+---
+
 ## Why another VPN client?
 
 Most Windows VPN clients are either ugly (`v2rayN`), heavy (Electron-based ~150 MB+),
