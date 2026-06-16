@@ -41,7 +41,15 @@ jobs:
           elif [ "${{ github.event_name }}" = "release" ]; then
             ARGS="${{ github.event.release.tag_name }}"
           fi
-          if [ -n "${{ inputs.edit_message_id }}" ]; then
-            ARGS="$ARGS --edit ${{ inputs.edit_message_id }}"
+          # Валидация edit_message_id — только цифры, чтобы случайно скопированный
+          # ярлык поля ("edit_message_id: 3") не попал как value.
+          EDIT_ID="${{ inputs.edit_message_id }}"
+          if [ -n "$EDIT_ID" ]; then
+            if echo "$EDIT_ID" | grep -qE '^[0-9]+$'; then
+              ARGS="$ARGS --edit $EDIT_ID"
+            else
+              echo "::error::edit_message_id must be a positive integer, got: $EDIT_ID"
+              exit 1
+            fi
           fi
           python scripts/notify_telegram.py $ARGS

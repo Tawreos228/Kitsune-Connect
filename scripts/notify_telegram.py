@@ -230,8 +230,12 @@ def main(argv: list[str]) -> int:
         if a == "--edit":
             i += 1
             if i >= len(argv):
-                print("ERROR: --edit требует номер message_id", file=sys.stderr); return 2
-            edit_id = int(argv[i])
+                print("ERROR: --edit требует число (message_id)", file=sys.stderr); return 2
+            try:
+                edit_id = int(argv[i])
+            except ValueError:
+                print(f"ERROR: --edit ожидает число, получено {argv[i]!r}", file=sys.stderr)
+                return 2
         elif not tag:
             tag = a
         else:
