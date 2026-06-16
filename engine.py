@@ -43,13 +43,29 @@ _GH_NEKORAY_API = "https://api.github.com/repos/MatsuriDayo/nekoray/releases/lat
 _GH_KITSUNE_API = "https://api.github.com/repos/Tawreos228/KitsuneVPN/releases/latest"
 
 # Версия приложения — синхронизировать с installer.iss MyAppVersion перед каждым релизом.
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.2.2"
 
 # базы для bundled-подобных rule-set'ов (тянутся ядром по требованию)
 _GEOSITE_URL = "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-{}.srs"
 _GEOIP_URL = "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-{}.srs"
 
 _MUX_PROTOS = {0: "smux", 1: "yamux", 2: "h2mux"}
+
+
+# Глобальные kwargs для subprocess: CREATE_NO_WINDOW флаг + STARTUPINFO с SW_HIDE.
+# Без этого даже PyInstaller-собранный exe с console=False может кратковременно
+# мигнуть консолью при запуске дочернего процесса (sing-box, schtasks, netsh).
+def _hidden_kwargs() -> dict:
+    flags = 0x08000000 if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+    kw = {"creationflags": flags}
+    try:
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0      # SW_HIDE
+        kw["startupinfo"] = si
+    except AttributeError:
+        pass    # не Windows
+    return kw
 
 
 def core_cmd() -> list[str]:
@@ -566,7 +582,7 @@ def check_config(cfg: dict) -> tuple[bool, str]:
     f = Path(tempfile.gettempdir()) / "kitsune_check.json"
     f.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
     r = subprocess.run(core_cmd() + ["check", "-c", str(f)],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, **_hidden_kwargs())
     return r.returncode == 0, (r.stderr or r.stdout).strip()
 
 
@@ -579,9 +595,8 @@ def core_version(exe: str = "sing-box.exe") -> str | None:
     try:
         args = ([str(p), "sing-box", "version"] if exe.lower().startswith("nekobox")
                 else [str(p), "version"])
-        flags = 0x08000000 if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
         r = subprocess.run(args, capture_output=True, text=True, timeout=5,
-                           creationflags=flags)
+                           **_hidden_kwargs())
         # официальный sing-box: "sing-box version 1.13.12"
         # nekobox_core:        "sing-box version v1.13.11"
         m = re.search(r"sing-box version\s+v?(\d+\.\d+\.\d+[\w\.\-]*)", r.stdout or "")
@@ -929,11 +944,10 @@ foreach ($d in $paths) {
 $out | ConvertTo-Json -Compress
 """
     try:
-        flags = 0x08000000 if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
         r = subprocess.run(
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
             capture_output=True, encoding="utf-8", errors="replace",
-            timeout=30, creationflags=flags,
+            timeout=30, **_hidden_kwargs(),
         )
         text = (r.stdout or "").strip()
         if not text:
@@ -965,14 +979,13 @@ KS_RULE_NAME = "Kitsune-KillSwitch-BlockOut"
 def firewall_block_all_outbound() -> bool:
     """Добавить правило netsh, блокирующее весь исходящий трафик. Требует админ-прав.
     Перед добавлением — превентивная чистка, чтобы не плодить дубликаты."""
-    flags = 0x08000000 if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
     firewall_unblock_all()
     try:
         r = subprocess.run(
             ["netsh", "advfirewall", "firewall", "add", "rule",
              f"name={KS_RULE_NAME}", "dir=out", "action=block",
              "enable=yes", "profile=any"],
-            capture_output=True, text=True, creationflags=flags, timeout=5)
+            capture_output=True, text=True, timeout=5, **_hidden_kwargs())
         return r.returncode == 0
     except Exception:
         return False
@@ -980,12 +993,11 @@ def firewall_block_all_outbound() -> bool:
 
 def firewall_unblock_all() -> bool:
     """Снять наше правило kill-switch (rc=0 если что-то удалили, иначе тоже норм — нечего было)."""
-    flags = 0x08000000 if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
     try:
         subprocess.run(
             ["netsh", "advfirewall", "firewall", "delete", "rule",
              f"name={KS_RULE_NAME}"],
-            capture_output=True, text=True, creationflags=flags, timeout=5)
+            capture_output=True, text=True, timeout=5, **_hidden_kwargs())
         return True
     except Exception:
         return False
@@ -1006,10 +1018,9 @@ ELEVATE_TASK_NAME = "Kitsune\\AutoElevate"
 
 def _schtasks(*args: str) -> int:
     """Запуск schtasks.exe без появления окна, возвращает returncode."""
-    flags = 0x08000000 if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
     try:
         return subprocess.run(["schtasks", *args], capture_output=True,
-                              creationflags=flags, timeout=10).returncode
+                              timeout=10, **_hidden_kwargs()).returncode
     except Exception:
         return 1
 
@@ -1295,13 +1306,12 @@ class Core:
         if not ok:
             raise RuntimeError("Невалидный конфиг: " + msg)
         self._cfg_path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
-        flags = 0x08000000 if hasattr(subprocess, "CREATE_NO_WINDOW") else 0  # CREATE_NO_WINDOW
         # Если есть on_log — захватываем stdout, иначе работаем как раньше (без захвата).
         if on_log is not None:
             self._proc = subprocess.Popen(
                 core_cmd() + ["run", "-c", str(self._cfg_path)],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1, creationflags=flags)
+                text=True, bufsize=1, **_hidden_kwargs())
             proc = self._proc
 
             def pump() -> None:
@@ -1317,7 +1327,7 @@ class Core:
             threading.Thread(target=pump, daemon=True).start()
         else:
             self._proc = subprocess.Popen(core_cmd() + ["run", "-c", str(self._cfg_path)],
-                                          creationflags=flags)
+                                          **_hidden_kwargs())
 
     def stop(self) -> None:
         if self._proc and self._proc.poll() is None:
