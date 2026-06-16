@@ -6,7 +6,7 @@
 
 **A Windows VPN client that doesn't get in your way.**
 
-[![Latest release](https://img.shields.io/github/v/release/Tawreos228/KitsuneVPN?label=download&color=FF7A2F&style=for-the-badge)](../../releases/latest)
+[![Download](https://img.shields.io/badge/download-latest_release-FF7A2F?style=for-the-badge)](../../releases/latest)
 [![Telegram](https://img.shields.io/badge/Telegram-@Kitsune__VPN-229ED9?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/Kitsune_VPN)
 
 [![sing-box](https://img.shields.io/badge/engine-sing--box_1.13-FF7A2F)](https://github.com/SagerNet/sing-box)
