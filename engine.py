@@ -69,7 +69,19 @@ def _tls_block(s: dict) -> dict | None:
         "server_name": s.get("sni") or s.get("address", ""),
         "utls": {"enabled": True, "fingerprint": s.get("fp") or "chrome"},
     }
+    # ALPN — для VLESS/Trojan если задан явно (для TUIC/HY2 setа в build_outbound)
+    if s.get("alpn"):
+        alpn = s["alpn"]
+        if isinstance(alpn, str):
+            alpn = [a.strip() for a in alpn.split(",") if a.strip()]
+        if alpn:
+            tls["alpn"] = alpn
+    if s.get("insecure"):
+        tls["insecure"] = True
     if s.get("reality"):
+        # sing-box принимает только public_key + short_id. spx (SpiderX) — xray-специфичный
+        # параметр, sing-box обрабатывает spider-path серверной стороной, у клиента он не нужен.
+        # Парсим из URL для совместимости с экспортом, но в outbound не пишем.
         tls["reality"] = {
             "enabled": True,
             "public_key": s.get("pbk", ""),
@@ -86,7 +98,11 @@ def _transport_block(s: dict) -> dict | None:
             tr["headers"] = {"Host": s["host"]}
         return tr
     if t == "grpc":
-        return {"type": "grpc", "service_name": s.get("serviceName") or ""}
+        tr = {"type": "grpc", "service_name": s.get("serviceName") or ""}
+        # gun — стандарт, multi — мультиплексирование на один поток
+        if s.get("grpcMode") == "multi":
+            tr["permit_without_stream"] = True
+        return tr
     if t == "httpupgrade":
         tr = {"type": "httpupgrade", "path": s.get("path") or "/"}
         if s.get("host"):
@@ -114,7 +130,10 @@ def build_outbound(s: dict) -> dict:
         if s.get("encryption") and s["encryption"] != "none":
             ob["encryption"] = s["encryption"]
     elif proto == "vmess":
-        ob = {"type": "vmess", **base, "uuid": s.get("uuid", ""), "security": "auto"}
+        ob = {"type": "vmess", **base, "uuid": s.get("uuid", ""),
+              "security": s.get("vmessSecurity") or "auto"}
+        if s.get("alterId"):
+            ob["alter_id"] = int(s["alterId"])
     elif proto == "trojan":
         ob = {"type": "trojan", **base, "password": s.get("password", "")}
     elif proto == "shadowsocks":

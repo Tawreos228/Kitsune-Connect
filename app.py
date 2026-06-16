@@ -305,6 +305,7 @@ class Backend(QObject):
             "coreloading":       "Загрузка обновления ядра…",
             "coreupdated":       "Ядро обновлено · {ver}",
             "coreupdfail":       "Не удалось обновить · {err}",
+            "subdedup":          "Удалено дублей: {n}",
             "stsstart":          "Замеряем скорость · {n} серверов",
             "stsdone":           "Замер скорости завершён",
             "filereadfail":      "Не удалось прочитать файл",
@@ -370,6 +371,7 @@ class Backend(QObject):
             "coreloading":       "Downloading core update…",
             "coreupdated":       "Core updated · {ver}",
             "coreupdfail":       "Update failed · {err}",
+            "subdedup":          "Removed duplicates: {n}",
             "stsstart":          "Speed-testing {n} servers",
             "stsdone":           "Speed test complete",
             "filereadfail":      "Failed to read file",
@@ -1694,12 +1696,15 @@ class Backend(QObject):
 
     # ---- сервера (профили) ----
     _PROFILE_KEYS = ["protocol", "address", "port", "uuid", "password", "method",
-                     "tls", "sni", "reality", "pbk", "sid", "transport", "path",
+                     "tls", "sni", "reality", "pbk", "sid", "spx", "transport", "path",
                      "host", "serviceName", "wgKey", "flow", "name", "encryption", "fp",
+                     "alpn", "grpcMode",
+                     # VMess-extra:
+                     "vmessSecurity", "alterId",
                      # WireGuard-only:
                      "peerKey", "localAddr", "allowedIps", "mtu", "psk",
                      # TUIC-only:
-                     "congestion", "udpRelayMode", "zeroRtt", "alpn", "insecure", "disableSni",
+                     "congestion", "udpRelayMode", "zeroRtt", "insecure", "disableSni",
                      # Hysteria 2-only:
                      "obfsType", "obfsPassword", "upMbps", "downMbps", "ports", "pinSHA256"]
 
@@ -1716,7 +1721,44 @@ class Backend(QObject):
                 srv[k] = data[k]
         return srv
 
+    def _dedup_key(self, s: dict) -> tuple:
+        """Ключ для дедупликации серверов в группе: protocol + address + port + creds.
+        Креды — uuid (vless/vmess/tuic) или password (trojan/ss/hy2/tuic). Имя/пинг — не учитываются."""
+        return (
+            (s.get("protocol") or "").lower(),
+            (s.get("address") or "").lower(),
+            int(s.get("port") or 0),
+            (s.get("uuid") or s.get("password") or "").strip(),
+        )
+
+    def _dedup_servers(self, servers: list) -> tuple[list, int]:
+        """Склейка дублей. Возвращает (unique, removed_count). При коллизии — первый встреченный
+        выигрывает, но переносим fav/speedMbps/speedAt с обоих если есть на дубле."""
+        seen: dict = {}
+        order: list = []
+        for s in servers:
+            k = self._dedup_key(s)
+            if not k[1] or not k[2]:    # без адреса/порта не дедуплим
+                order.append(s)
+                continue
+            if k not in seen:
+                seen[k] = dict(s)
+                order.append(seen[k])
+            else:
+                # объединяем «качественные» поля от дубликата (вдруг у первого их не было)
+                cur = seen[k]
+                if s.get("fav") and not cur.get("fav"):
+                    cur["fav"] = True
+                if s.get("speedMbps") and not cur.get("speedMbps"):
+                    cur["speedMbps"] = s["speedMbps"]
+                    if s.get("speedAt"): cur["speedAt"] = s["speedAt"]
+        removed = len(servers) - len(order)
+        return order, removed
+
     def _replace_group_servers(self, servers: list) -> None:
+        servers, dup = self._dedup_servers(servers or [])
+        if dup > 0:
+            self.notify.emit(self._tr("subdedup", n=dup), "info")
         g = dict(self._groups[self._currentGroup])
         g["servers"] = servers
         self._groups = (self._groups[:self._currentGroup] + [g]
@@ -1824,6 +1866,8 @@ class Backend(QObject):
                 def g(k, d=""):
                     return q.get(k, [d])[0]
 
+                alpn_raw = g("alpn", "")
+                alpn_list = [a.strip() for a in alpn_raw.split(",") if a.strip()] if alpn_raw else []
                 data = {
                     "protocol": proto,
                     "address": u.hostname or "",
@@ -1833,28 +1877,37 @@ class Backend(QObject):
                 if proto == "vless":
                     data["uuid"] = u.username or ""
                 else:
-                    data["password"] = u.username or ""
+                    data["password"] = unquote(u.username or "")    # пароли часто URL-encoded
                 sec = g("security", "none")
                 data["tls"] = sec in ("tls", "reality")
                 data["reality"] = sec == "reality"
                 data["sni"] = g("sni") or g("host")
                 data["pbk"] = g("pbk")
                 data["sid"] = g("sid")
+                data["spx"] = unquote(g("spx", ""))                  # Reality spider-path
                 data["flow"] = g("flow")
                 data["encryption"] = g("encryption")
                 data["fp"] = g("fp")
+                if alpn_list: data["alpn"] = alpn_list
                 t = g("type", "tcp")
-                data["transport"] = t if t in ("tcp", "ws", "grpc", "xhttp") else "tcp"
-                data["path"] = g("path")
+                data["transport"] = t if t in ("tcp", "ws", "grpc", "xhttp", "httpupgrade") else "tcp"
+                data["path"] = unquote(g("path", ""))
                 data["host"] = g("host")
                 data["serviceName"] = g("serviceName")
+                # gRPC mode: gun (по умолчанию) / multi
+                if g("mode"): data["grpcMode"] = g("mode")
                 return data
             if link.startswith("vmess://"):
                 raw = link[8:]
                 raw += "=" * (-len(raw) % 4)
                 j = json.loads(base64.b64decode(raw).decode("utf-8", "ignore"))
                 net = j.get("net", "tcp")
-                return {
+                alpn_raw = j.get("alpn", "")
+                if isinstance(alpn_raw, list):
+                    alpn_list = [str(a).strip() for a in alpn_raw if str(a).strip()]
+                else:
+                    alpn_list = [a.strip() for a in str(alpn_raw).split(",") if a.strip()]
+                data = {
                     "protocol": "vmess",
                     "name": j.get("ps") or j.get("add", ""),
                     "address": j.get("add", ""),
@@ -1862,10 +1915,29 @@ class Backend(QObject):
                     "uuid": j.get("id", ""),
                     "tls": j.get("tls", "") == "tls",
                     "sni": j.get("sni", "") or j.get("host", ""),
-                    "transport": net if net in ("tcp", "ws", "grpc", "xhttp") else "tcp",
+                    "transport": net if net in ("tcp", "ws", "grpc", "xhttp", "httpupgrade") else "tcp",
                     "path": j.get("path", ""),
                     "host": j.get("host", ""),
                 }
+                # security/cipher: auto/aes-128-gcm/chacha20-poly1305/none/zero
+                scy = j.get("scy") or j.get("security") or j.get("type")
+                if scy and scy in ("auto", "aes-128-gcm", "chacha20-poly1305", "none", "zero"):
+                    data["vmessSecurity"] = scy
+                # alterId (legacy MD5-AEAD): 0 = AEAD, >0 = legacy
+                try:
+                    aid = int(j.get("aid") or 0)
+                    if aid > 0: data["alterId"] = aid
+                except (TypeError, ValueError):
+                    pass
+                if alpn_list: data["alpn"] = alpn_list
+                if j.get("fp"): data["fp"] = j.get("fp")
+                # gRPC mode (gun / multi) приходит в "type" поле — но переименовали скрипт
+                if j.get("type") in ("gun", "multi") and net == "grpc":
+                    data["grpcMode"] = j.get("type")
+                # serviceName для gRPC может прийти как "path"
+                if net == "grpc" and not j.get("serviceName"):
+                    data["serviceName"] = j.get("path") or ""
+                return data
             if link.startswith("tuic://"):
                 # tuic://uuid:password@host:port?congestion_control=bbr&udp_relay_mode=native
                 #     &alpn=h3,spdy/3.1&sni=...&allow_insecure=0&disable_sni=0#name
