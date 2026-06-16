@@ -1,0 +1,47 @@
+name: Notify Telegram on release
+
+on:
+  release:
+    types: [published]
+  # ручной запуск для тест/перепоста: Actions → Run workflow → ввести тег
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to post (e.g. v0.2.1). Leave blank for latest.'
+        required: false
+        type: string
+      edit_message_id:
+        description: 'Optional: edit an existing Telegram message id instead of posting new.'
+        required: false
+        type: string
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Post release to @Kitsune_VPN
+        env:
+          KITSUNE_TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          if [ -z "$KITSUNE_TG_TOKEN" ]; then
+            echo "::warning::TELEGRAM_BOT_TOKEN secret not set — skipping notification."
+            exit 0
+          fi
+          ARGS=""
+          if [ -n "${{ inputs.tag }}" ]; then
+            ARGS="${{ inputs.tag }}"
+          elif [ "${{ github.event_name }}" = "release" ]; then
+            ARGS="${{ github.event.release.tag_name }}"
+          fi
+          if [ -n "${{ inputs.edit_message_id }}" ]; then
+            ARGS="$ARGS --edit ${{ inputs.edit_message_id }}"
+          fi
+          python scripts/notify_telegram.py $ARGS
