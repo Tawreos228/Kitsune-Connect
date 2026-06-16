@@ -1697,7 +1697,11 @@ class Backend(QObject):
                      "tls", "sni", "reality", "pbk", "sid", "transport", "path",
                      "host", "serviceName", "wgKey", "flow", "name", "encryption", "fp",
                      # WireGuard-only:
-                     "peerKey", "localAddr", "allowedIps", "mtu", "psk"]
+                     "peerKey", "localAddr", "allowedIps", "mtu", "psk",
+                     # TUIC-only:
+                     "congestion", "udpRelayMode", "zeroRtt", "alpn", "insecure", "disableSni",
+                     # Hysteria 2-only:
+                     "obfsType", "obfsPassword", "upMbps", "downMbps", "ports", "pinSHA256"]
 
     def _make_server(self, data: dict, keep_ping=None) -> dict:
         name = (data.get("name") or "").strip() or (data.get("address") or "Сервер")
@@ -1863,14 +1867,16 @@ class Backend(QObject):
                     "host": j.get("host", ""),
                 }
             if link.startswith("tuic://"):
-                # tuic://uuid:password@host:port?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=...#name
+                # tuic://uuid:password@host:port?congestion_control=bbr&udp_relay_mode=native
+                #     &alpn=h3,spdy/3.1&sni=...&allow_insecure=0&disable_sni=0#name
                 u = urlparse(link)
                 q = parse_qs(u.query)
                 def g(k, d=""): return q.get(k, [d])[0]
-                # креды: uuid:password
                 uid, pwd = (u.username or ""), ""
                 if u.password is not None:
                     pwd = u.password
+                alpn_raw = g("alpn") or "h3"
+                alpn_list = [a.strip() for a in alpn_raw.split(",") if a.strip()]
                 data = {
                     "protocol": "tuic",
                     "name": unquote(u.fragment) if u.fragment else (u.hostname or ""),
@@ -1880,36 +1886,81 @@ class Backend(QObject):
                     "password": unquote(pwd),
                     "tls": True,
                     "sni": g("sni") or g("peer") or "",
+                    "alpn": alpn_list,                                 # обязательно для TUIC
                     "congestion": g("congestion_control") or g("cc") or "bbr",
                     "udpRelayMode": g("udp_relay_mode") or g("urm") or "native",
                     "zeroRtt": g("zero_rtt") in ("1", "true", "yes"),
+                    "insecure": g("allow_insecure") in ("1", "true", "yes"),
+                    "disableSni": g("disable_sni") in ("1", "true", "yes"),
                 }
                 return data
             if link.startswith("hy2://") or link.startswith("hysteria2://"):
-                # hy2://password@host:port?sni=...&obfs=salamander&obfs-password=xxx&insecure=0#name
-                u = urlparse(link)
-                q = parse_qs(u.query)
+                # hy2://password@host:port[,port2,p3-p4]?sni=...&obfs=salamander&obfs-password=xxx
+                #      &insecure=0&pinSHA256=…&upmbps=…&downmbps=…#name
+                # urlparse не справляется с запятыми/диапазонами в port — извлекаем netloc вручную.
+                scheme_sep = link.index("://") + 3
+                rest = link[scheme_sep:]
+                frag = ""
+                if "#" in rest:
+                    rest, frag = rest.split("#", 1)
+                query = ""
+                if "?" in rest:
+                    rest, query = rest.split("?", 1)
+                # rest сейчас: [userinfo@]host[:portspec][/...]
+                if "/" in rest:
+                    rest = rest.split("/", 1)[0]
+                pwd = ""
+                if "@" in rest:
+                    cred, hostpart = rest.rsplit("@", 1)
+                    pwd = cred
+                else:
+                    hostpart = rest
+                # hostpart может содержать ':' для портов; если есть запятая/дефис — это port hopping
+                host = hostpart
+                port_single = 443
+                ports_spec = ""
+                if ":" in hostpart:
+                    host, port_raw = hostpart.rsplit(":", 1)
+                    if "," in port_raw or "-" in port_raw:
+                        ports_spec = port_raw
+                        # для single-port берём первый из списка как fallback
+                        first = port_raw.replace("-", ",").split(",", 1)[0]
+                        try: port_single = int(first)
+                        except ValueError: port_single = 443
+                    else:
+                        try: port_single = int(port_raw)
+                        except ValueError: port_single = 443
+                q = parse_qs(query)
                 def g(k, d=""): return q.get(k, [d])[0]
-                # пароль в userinfo (без отдельного юзера)
-                pwd = u.username or ""
-                if u.password is not None:
-                    pwd = u.password
                 obfs_t = g("obfs") or ""
                 obfs_pwd = g("obfs-password") or g("obfs_password") or ""
                 data = {
                     "protocol": "hysteria2",
-                    "name": unquote(u.fragment) if u.fragment else (u.hostname or ""),
-                    "address": u.hostname or "",
-                    "port": u.port or 443,
+                    "name": unquote(frag) if frag else host,
+                    "address": host,
+                    "port": port_single,
                     "password": unquote(pwd),
                     "tls": True,
                     "sni": g("sni") or g("peer") or "",
                     "insecure": g("insecure") in ("1", "true", "yes"),
                 }
+                if ports_spec:
+                    # Sing-box ожидает "2080:3000" (двоеточие), приводим из hysteria-стиля
+                    # "1080,5000-6000" → ["1080:1080", "5000:6000"]
+                    pieces = []
+                    for chunk in ports_spec.split(","):
+                        chunk = chunk.strip()
+                        if "-" in chunk:
+                            a, _, b = chunk.partition("-")
+                            pieces.append(f"{a.strip()}:{b.strip()}")
+                        elif chunk:
+                            pieces.append(f"{chunk}:{chunk}")
+                    if pieces:
+                        data["ports"] = pieces
                 if obfs_t and obfs_pwd:
                     data["obfsType"] = obfs_t
                     data["obfsPassword"] = unquote(obfs_pwd)
-                # необязательные rate hints
+                if g("pinSHA256"): data["pinSHA256"] = g("pinSHA256")
                 if g("upmbps"): data["upMbps"] = g("upmbps")
                 if g("downmbps"): data["downMbps"] = g("downmbps")
                 return data

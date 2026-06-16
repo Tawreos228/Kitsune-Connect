@@ -122,7 +122,7 @@ def build_outbound(s: dict) -> dict:
               "method": s.get("method") or "aes-256-gcm", "password": s.get("password", "")}
     elif proto == "tuic":
         # TUIC v5 — поверх QUIC. uuid + password = креды; congestion_control + udp_relay_mode
-        # — performance-параметры; tls обязательны.
+        # — performance-параметры; ALPN обязателен и должен совпадать с сервером.
         ob = {
             "type": "tuic", **base,
             "uuid": s.get("uuid", ""),
@@ -134,35 +134,52 @@ def build_outbound(s: dict) -> dict:
             ob["udp_relay_mode"] = s["udpRelayMode"]      # native / quic
         if s.get("zeroRtt"):
             ob["zero_rtt_handshake"] = True
-        # TUIC всегда TLS+ALPN h3
+        # TLS-блок: server_name/alpn/insecure берутся из дикта, всё остальное — из _tls_block
         ob["tls"] = tls or {"enabled": True}
-        if not ob["tls"].get("alpn"):
-            ob["tls"]["alpn"] = ["h3"]
-        if s.get("sni") and "server_name" not in ob["tls"]:
+        alpn = s.get("alpn") or ["h3"]
+        if isinstance(alpn, str):
+            alpn = [a.strip() for a in alpn.split(",") if a.strip()]
+        ob["tls"]["alpn"] = alpn
+        if s.get("sni") and not s.get("disableSni"):
             ob["tls"]["server_name"] = s["sni"]
+        elif s.get("disableSni"):
+            ob["tls"].pop("server_name", None)
+        if s.get("insecure"):
+            ob["tls"]["insecure"] = True
         return ob
     elif proto == "hysteria2":
-        # Hysteria 2 — QUIC + brutal congestion + obfs salamander.
+        # Hysteria 2 — QUIC + brutal congestion + opt obfs salamander.
+        # Поддерживается port hopping: список диапазонов в server_ports вместо server_port.
         ob = {
             "type": "hysteria2", **base,
             "password": s.get("password", ""),
         }
+        ports = s.get("ports")
+        if ports and isinstance(ports, list):
+            # server_ports конфликтует с server_port — убираем последний
+            ob.pop("server_port", None)
+            ob["server_ports"] = ports
         # obfs — опционально, тип salamander поверх UDP
         if s.get("obfsPassword"):
             ob["obfs"] = {
                 "type": s.get("obfsType") or "salamander",
                 "password": s["obfsPassword"],
             }
-        # rate hints (UI-side, для congestion-планирования)
+        # rate hints (для congestion-планирования)
         if s.get("upMbps"):
-            ob["up_mbps"] = int(s["upMbps"])
+            try: ob["up_mbps"] = int(s["upMbps"])
+            except ValueError: pass
         if s.get("downMbps"):
-            ob["down_mbps"] = int(s["downMbps"])
+            try: ob["down_mbps"] = int(s["downMbps"])
+            except ValueError: pass
         ob["tls"] = tls or {"enabled": True}
         if s.get("sni") and "server_name" not in ob["tls"]:
             ob["tls"]["server_name"] = s["sni"]
         if s.get("insecure"):
             ob["tls"]["insecure"] = True
+        # pinSHA256 — сохраняется в сервер-dict, но не пропагируется в outbound:
+        # sing-box не имеет прямого поля под SHA256-pin (использует tls.certificate с PEM).
+        # Парсим из URL для дальнейших ревизий, без поломки текущего конфига.
         return ob
     else:
         # wireguard и прочее — TODO (отдельная схема endpoints в sing-box 1.13)
