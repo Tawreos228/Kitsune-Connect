@@ -1862,6 +1862,57 @@ class Backend(QObject):
                     "path": j.get("path", ""),
                     "host": j.get("host", ""),
                 }
+            if link.startswith("tuic://"):
+                # tuic://uuid:password@host:port?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=...#name
+                u = urlparse(link)
+                q = parse_qs(u.query)
+                def g(k, d=""): return q.get(k, [d])[0]
+                # креды: uuid:password
+                uid, pwd = (u.username or ""), ""
+                if u.password is not None:
+                    pwd = u.password
+                data = {
+                    "protocol": "tuic",
+                    "name": unquote(u.fragment) if u.fragment else (u.hostname or ""),
+                    "address": u.hostname or "",
+                    "port": u.port or 443,
+                    "uuid": unquote(uid),
+                    "password": unquote(pwd),
+                    "tls": True,
+                    "sni": g("sni") or g("peer") or "",
+                    "congestion": g("congestion_control") or g("cc") or "bbr",
+                    "udpRelayMode": g("udp_relay_mode") or g("urm") or "native",
+                    "zeroRtt": g("zero_rtt") in ("1", "true", "yes"),
+                }
+                return data
+            if link.startswith("hy2://") or link.startswith("hysteria2://"):
+                # hy2://password@host:port?sni=...&obfs=salamander&obfs-password=xxx&insecure=0#name
+                u = urlparse(link)
+                q = parse_qs(u.query)
+                def g(k, d=""): return q.get(k, [d])[0]
+                # пароль в userinfo (без отдельного юзера)
+                pwd = u.username or ""
+                if u.password is not None:
+                    pwd = u.password
+                obfs_t = g("obfs") or ""
+                obfs_pwd = g("obfs-password") or g("obfs_password") or ""
+                data = {
+                    "protocol": "hysteria2",
+                    "name": unquote(u.fragment) if u.fragment else (u.hostname or ""),
+                    "address": u.hostname or "",
+                    "port": u.port or 443,
+                    "password": unquote(pwd),
+                    "tls": True,
+                    "sni": g("sni") or g("peer") or "",
+                    "insecure": g("insecure") in ("1", "true", "yes"),
+                }
+                if obfs_t and obfs_pwd:
+                    data["obfsType"] = obfs_t
+                    data["obfsPassword"] = unquote(obfs_pwd)
+                # необязательные rate hints
+                if g("upmbps"): data["upMbps"] = g("upmbps")
+                if g("downmbps"): data["downMbps"] = g("downmbps")
+                return data
             if link.startswith("ss://"):
                 rest = link[5:]
                 name = ""

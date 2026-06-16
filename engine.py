@@ -120,6 +120,50 @@ def build_outbound(s: dict) -> dict:
     elif proto == "shadowsocks":
         ob = {"type": "shadowsocks", **base,
               "method": s.get("method") or "aes-256-gcm", "password": s.get("password", "")}
+    elif proto == "tuic":
+        # TUIC v5 — поверх QUIC. uuid + password = креды; congestion_control + udp_relay_mode
+        # — performance-параметры; tls обязательны.
+        ob = {
+            "type": "tuic", **base,
+            "uuid": s.get("uuid", ""),
+            "password": s.get("password", ""),
+        }
+        if s.get("congestion"):
+            ob["congestion_control"] = s["congestion"]    # bbr / cubic / new_reno
+        if s.get("udpRelayMode"):
+            ob["udp_relay_mode"] = s["udpRelayMode"]      # native / quic
+        if s.get("zeroRtt"):
+            ob["zero_rtt_handshake"] = True
+        # TUIC всегда TLS+ALPN h3
+        ob["tls"] = tls or {"enabled": True}
+        if not ob["tls"].get("alpn"):
+            ob["tls"]["alpn"] = ["h3"]
+        if s.get("sni") and "server_name" not in ob["tls"]:
+            ob["tls"]["server_name"] = s["sni"]
+        return ob
+    elif proto == "hysteria2":
+        # Hysteria 2 — QUIC + brutal congestion + obfs salamander.
+        ob = {
+            "type": "hysteria2", **base,
+            "password": s.get("password", ""),
+        }
+        # obfs — опционально, тип salamander поверх UDP
+        if s.get("obfsPassword"):
+            ob["obfs"] = {
+                "type": s.get("obfsType") or "salamander",
+                "password": s["obfsPassword"],
+            }
+        # rate hints (UI-side, для congestion-планирования)
+        if s.get("upMbps"):
+            ob["up_mbps"] = int(s["upMbps"])
+        if s.get("downMbps"):
+            ob["down_mbps"] = int(s["downMbps"])
+        ob["tls"] = tls or {"enabled": True}
+        if s.get("sni") and "server_name" not in ob["tls"]:
+            ob["tls"]["server_name"] = s["sni"]
+        if s.get("insecure"):
+            ob["tls"]["insecure"] = True
+        return ob
     else:
         # wireguard и прочее — TODO (отдельная схема endpoints в sing-box 1.13)
         ob = {"type": "direct", "tag": "proxy"}
