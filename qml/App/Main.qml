@@ -371,8 +371,14 @@ ApplicationWindow {
             backend.setKillSwitchEnabled(setKill)         // прокинуть начальное значение kill-switch
             backend.setSubRefreshInterval(subRefreshInterval)   // порядок важен: сначала интервал
             backend.setSubAutoRefresh(setSubAutoRefresh)        // потом включение — стартанёт timer/QTimer.singleShot уже в startup()
-            // первый запуск — открываем мастер настройки после короткой паузы (даёт UI собраться)
-            if (!firstRunDone) Qt.callLater(function() { wizardStep = 0; wizardOpen = true })
+            // Первый запуск — открываем мастер настройки. КРИТИЧНО: проверка firstRunDone должна
+            // быть ВНУТРИ Qt.callLater. Component.onCompleted срабатывает синхронно во время
+            // engine.load() — РАНЬШЕ чем AppController вызовет importSettings() и установит
+            // firstRunDone из persisted snapshot. Если проверять снаружи, флаг всегда false на
+            // момент scheduling, и мастер открывается на каждом запуске вечно.
+            Qt.callLater(function() {
+                if (!firstRunDone) { wizardStep = 0; wizardOpen = true }
+            })
             backend.setLang(T.lang)                       // i18n: язык Backend-notify
         }
     }

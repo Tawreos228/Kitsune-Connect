@@ -262,6 +262,12 @@ class Backend(QObject):
         mode = data.get("mode")
         if mode in ("proxy", "tun"):
             self._mode = mode
+        ac = data.get("autoConnect")
+        if isinstance(ac, bool):
+            self._auto_connect = ac
+        acm = data.get("autoConnectMode")
+        if isinstance(acm, int) and acm in (0, 1):
+            self._auto_connect_mode = acm
         return True
 
     def _save_state(self) -> None:
@@ -273,6 +279,8 @@ class Backend(QObject):
                 "currentGroup": self._currentGroup,
                 "server": self._server,
                 "mode": self._mode,
+                "autoConnect": self._auto_connect,
+                "autoConnectMode": self._auto_connect_mode,
             }
             self._state_path().write_text(
                 json.dumps(payload, ensure_ascii=False, indent=1),
@@ -502,6 +510,7 @@ class Backend(QObject):
         if v != self._auto_connect:
             self._auto_connect = v
             self.autoConnectChanged.emit()
+            self._save_state()      # персист между запусками
 
     autoConnect = Property(bool, _get_auto, _set_auto, notify=autoConnectChanged)
 
@@ -512,6 +521,7 @@ class Backend(QObject):
         if v != self._auto_connect_mode:
             self._auto_connect_mode = v
             self.autoConnectModeChanged.emit()
+            self._save_state()      # персист между запусками
 
     autoConnectMode = Property(int, _get_auto_mode, _set_auto_mode, notify=autoConnectModeChanged)
 
