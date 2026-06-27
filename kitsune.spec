@@ -5,6 +5,7 @@
      и обновление потеряется при следующем запуске.
 """
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 
 ROOT = Path(".").resolve()
 
@@ -27,6 +28,10 @@ hiddenimports = [
     "PySide6.QtNetwork",
     "segno",
 ]
+# PyYAML: late import в engine.parse_clash_proxies. Без явного collect_submodules
+# PyInstaller подтянет только _yaml.pyd (нативный) без yaml/__init__.py — import упадёт.
+hiddenimports += collect_submodules("yaml")
+datas += collect_data_files("yaml")
 
 # Excludes — что точно не нужно тащить (экономия размера)
 excludes = [

@@ -1,4 +1,4 @@
-"""Постит (или редактирует) GitHub-релиз в Telegram-канал @Kitsune_VPN.
+"""Постит (или редактирует) GitHub-релиз в Telegram-канал @KitsuneConnect.
 
 Использование:
     python scripts/notify_telegram.py                       # latest release
@@ -18,8 +18,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-REPO    = "Tawreos228/KitsuneVPN"
-CHANNEL = "@Kitsune_VPN"
+REPO    = "Tawreos228/Kitsune-Connect"
+CHANNEL = "@KitsuneConnect"
 GH_API  = "https://api.github.com"
 TG_API  = "https://api.telegram.org"
 
@@ -279,7 +279,7 @@ def main(argv: list[str]) -> int:
     msg_id = resp["result"]["message_id"]
     verb = "edited" if edit_id is not None else "posted to"
     print(f"✓ {verb} {CHANNEL} — message_id={msg_id}")
-    print(f"  link: https://t.me/Kitsune_VPN/{msg_id}")
+    print(f"  link: https://t.me/KitsuneConnect/{msg_id}")
     return 0
 
 

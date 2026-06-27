@@ -27,7 +27,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Post release to @Kitsune_VPN
+      - name: Post release to @KitsuneConnect
         env:
           KITSUNE_TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |

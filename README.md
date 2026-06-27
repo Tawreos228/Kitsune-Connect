@@ -2,12 +2,12 @@
 
 <img src="assets/icon.png" width="120" alt="Kitsune">
 
-# Kitsune
+# Kitsune Connect
 
 **A Windows VPN client that doesn't get in your way.**
 
 [![Download](https://img.shields.io/badge/download-latest_release-FF7A2F?style=for-the-badge)](../../releases/latest)
-[![Telegram](https://img.shields.io/badge/Telegram-@Kitsune__VPN-229ED9?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/Kitsune_VPN)
+[![Telegram](https://img.shields.io/badge/Telegram-@KitsuneConnect-229ED9?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/KitsuneConnect)
 
 [![sing-box](https://img.shields.io/badge/engine-sing--box_1.13-FF7A2F)](https://github.com/SagerNet/sing-box)
 [![Qt](https://img.shields.io/badge/UI-PySide6_%2F_QML-0A84FF)](https://doc.qt.io/qtforpython-6/)
@@ -215,8 +215,8 @@ threads; results delivered via queued signals.
 Requires Python 3.11+ and PySide6.
 
 ```bash
-git clone https://github.com/Tawreos228/KitsuneVPN
-cd KitsuneVPN
+git clone https://github.com/Tawreos228/Kitsune-Connect
+cd Kitsune-Connect
 python -m pip install PySide6 segno Pillow pyinstaller
 python core/fetch_core.py        # downloads official sing-box.exe
 python app.py                    # run in dev mode
@@ -253,7 +253,7 @@ Being honest about scope:
 This is an actively developing project &mdash; expect rough edges. **All feedback is welcome:**
 
 - 📣 &nbsp; **Stay in the loop** &mdash; new releases land automatically on the
-  [Telegram channel](https://t.me/Kitsune_VPN). Quickest way to be notified about hotfixes.
+  [Telegram channel](https://t.me/KitsuneConnect). Quickest way to be notified about hotfixes.
 - 🐞 &nbsp; **Something broken?** &mdash; [open a bug report](../../issues/new?template=bug_report.md).
   Include your Windows version, what you did, what happened, and what you expected.
 - 🤔 &nbsp; **Something behaves weirdly?** &mdash; tell us. Even if it's "this dialog felt

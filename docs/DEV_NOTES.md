@@ -5,8 +5,8 @@
 > Старый `…/nekobox-ui/HANDOFF.md` — УСТАРЕЛ (там старый план C++-форка); актуальное — здесь.
 
 ## 0. TL;DR
-Проект **Kitsune** — десктоп VPN-клиент (Windows). Репозиторий **github.com/Tawreos228/KitsuneVPN** (PRIVATE).
-Локально: `C:\Users\danii\Documents\KitsuneVPN`.
+Проект **Kitsune Connect** — десктоп VPN-клиент (Windows). Репозиторий **github.com/Tawreos228/Kitsune-Connect**.
+Локально: `C:\Users\danii\Documents\KitsuneVPN` (папку пока не переименовываем).
 - **UI:** PySide6 + QML (Qt Quick) — готов и отполирован (эппловский стиль, анимации, 3 темы).
 - **Движок:** Python (`engine.py`) управляет **ядром sing-box** как отдельным процессом.
   По умолчанию берётся **`core/nekobox_core.exe`** (патченый sing-box, больше протоколов) через CLI `sing-box run -c`;

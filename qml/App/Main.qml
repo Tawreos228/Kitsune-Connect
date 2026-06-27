@@ -852,7 +852,7 @@ ApplicationWindow {
                 Text {
                     Layout.alignment: Qt.AlignHCenter
                     Layout.topMargin: 18
-                    text: "Kitsune VPN"
+                    text: "Kitsune Connect"
                     color: Theme.text
                     font.family: Theme.fontFamily
                     font.pixelSize: 24
@@ -1590,7 +1590,7 @@ ApplicationWindow {
                                         font.family: Theme.fontFamily; font.pixelSize: 13; font.weight: Font.DemiBold
                                     }
                                     HoverHandler { id: openTgHover; cursorShape: Qt.PointingHandCursor }
-                                    TapHandler { onTapped: backend.openUrl("https://t.me/Kitsune_VPN") }
+                                    TapHandler { onTapped: backend.openUrl("https://t.me/KitsuneConnect") }
                                 }
                             }
                             Rectangle { Layout.fillWidth: true; Layout.leftMargin: 50; height: 1; color: Theme.stroke }
@@ -1609,7 +1609,7 @@ ApplicationWindow {
                                         font.family: Theme.fontFamily; font.pixelSize: 13
                                     }
                                     HoverHandler { id: openGhHover; cursorShape: Qt.PointingHandCursor }
-                                    TapHandler { onTapped: backend.openUrl("https://github.com/Tawreos228/KitsuneVPN") }
+                                    TapHandler { onTapped: backend.openUrl("https://github.com/Tawreos228/Kitsune-Connect") }
                                 }
                             }
                         }

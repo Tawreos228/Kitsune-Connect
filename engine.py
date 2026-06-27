@@ -40,7 +40,7 @@ CLASH_PORT = 9090
 PROXY_TAG = "proxy"
 _GH_SINGBOX_API = "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
 _GH_NEKORAY_API = "https://api.github.com/repos/MatsuriDayo/nekoray/releases/latest"
-_GH_KITSUNE_API = "https://api.github.com/repos/Tawreos228/KitsuneVPN/releases/latest"
+_GH_KITSUNE_API = "https://api.github.com/repos/Tawreos228/Kitsune-Connect/releases/latest"
 
 # Версия приложения — синхронизировать с installer.iss MyAppVersion перед каждым релизом.
 APP_VERSION = "0.3.0"
@@ -661,7 +661,7 @@ def latest_nekoray_release() -> dict | None:
 
 
 def latest_kitsune_release() -> dict | None:
-    """{tag, setup_url, setup_size, notes_url} последнего релиза KitsuneVPN.
+    """{tag, setup_url, setup_size, notes_url} последнего релиза Kitsune Connect.
     Берёт первый asset, заканчивающийся на KitsuneSetup.exe (фиксированное имя в installer.iss)."""
     data = _github_latest(_GH_KITSUNE_API)
     if not isinstance(data, dict):
