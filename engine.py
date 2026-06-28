@@ -43,7 +43,7 @@ _GH_NEKORAY_API = "https://api.github.com/repos/MatsuriDayo/nekoray/releases/lat
 _GH_KITSUNE_API = "https://api.github.com/repos/Tawreos228/Kitsune-Connect/releases/latest"
 
 # Версия приложения — синхронизировать с installer.iss MyAppVersion перед каждым релизом.
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 
 # базы для bundled-подобных rule-set'ов (тянутся ядром по требованию)
 _GEOSITE_URL = "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-{}.srs"
