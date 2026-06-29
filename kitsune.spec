@@ -14,8 +14,7 @@ datas = [
     (str(ROOT / "qml"), "qml"),                              # все QML файлы и qmldir
     (str(ROOT / "assets"), "assets"),                         # иконки, кадры трея
     (str(ROOT / "core" / "rulesets"), "core/rulesets"),       # bundled .srs
-    (str(ROOT / "core" / "nekobox_core.exe"), "core"),        # патченый core (приоритетный)
-    (str(ROOT / "core" / "sing-box.exe"), "core"),            # официальный fallback
+    (str(ROOT / "core" / "sing-box.exe"), "core"),            # официальный sing-box (upstream)
 ]
 
 # Hidden imports — PyInstaller часто пропускает Qt-плагины и quick controls

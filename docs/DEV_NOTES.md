@@ -9,8 +9,11 @@
 Локально: `C:\Users\danii\Documents\KitsuneVPN` (папку пока не переименовываем).
 - **UI:** PySide6 + QML (Qt Quick) — готов и отполирован (эппловский стиль, анимации, 3 темы).
 - **Движок:** Python (`engine.py`) управляет **ядром sing-box** как отдельным процессом.
-  По умолчанию берётся **`core/nekobox_core.exe`** (патченый sing-box, больше протоколов) через CLI `sing-box run -c`;
-  если его нет — официальный `core/sing-box.exe`. Ядро то же, что у NekoBox → **скорость/качество идентичны**.
+  Используется **официальный `core/sing-box.exe`** (upstream SagerNet/sing-box, v1.13.12+).
+  Раньше пробовали `nekobox_core.exe` (форк MatsuriDayo) ради дополнительных протоколов
+  (Naive/Tailscale/ShadowTLS), но эти теги уже в upstream-сборке, плюс кнопка «Update
+  sing-box» в UI обновляла только sing-box.exe (а runtime запускался на nekobox) — был
+  рассинхрон. С v0.4.0 — только upstream, всё совпадает с тем что показывает UI.
 - Сейчас UI работает на **моковом** `Backend` (в app.py). `engine.py` уже умеет генерить конфиг/валидировать/
   запускать-останавливать ядро, но **ещё НЕ связан с Backend** (это след. шаг).
 

@@ -69,11 +69,10 @@ def _hidden_kwargs() -> dict:
 
 
 def core_cmd() -> list[str]:
-    """База команды ядра. Если есть патченый nekobox_core (больше протоколов) — берём его
-    в CLI-режиме (`sing-box` subcommand), иначе официальный sing-box."""
-    nb = _CORE_DIR / "nekobox_core.exe"
-    if nb.exists():
-        return [str(nb), "sing-box"]
+    """База команды ядра — официальный sing-box.exe (upstream SagerNet/sing-box).
+    Раньше пытались использовать nekobox_core.exe (форк MatsuriDayo) для лишних протоколов
+    типа Naive — но он расходился с тем что обновляет UI-кнопка «Update sing-box». Перешли
+    на чистый upstream чтобы то-что-в-UI совпадало с тем-что-реально-запускается."""
     return [str(_CORE_DIR / "sing-box.exe")]
 
 
@@ -509,27 +508,12 @@ def _wireguard_endpoint(s: dict) -> dict:
         "mtu": mtu,
         "peers": [peer],
     }
-    # AmneziaWG 1.5: nekobox_core.exe (with_awg, sing-box v1.13.11) поддерживает базовые
-    # поля обфускации с full-name ключами. AWG 2.0 поля (S0/S3/S4 и CPS-пакеты I1-I5)
-    # nekobox пока не реализует — мы их храним в server-dict для совместимости с .conf,
-    # но в JSON не эмитим (иначе sing-box "unknown field" → конфиг отклоняется).
-    _AWG_KEY_MAP = {
-        "jc":   "junk_packet_count",
-        "jmin": "junk_packet_min_size",
-        "jmax": "junk_packet_max_size",
-        "s1":   "init_packet_junk_size",
-        "s2":   "response_packet_junk_size",
-        "h1":   "init_packet_magic_header",
-        "h2":   "response_packet_magic_header",
-        "h3":   "underload_packet_magic_header",
-        "h4":   "transport_packet_magic_header",
-    }
-    for short, long in _AWG_KEY_MAP.items():
-        if short in s and s[short] is not None:
-            try:
-                ep[long] = int(s[short])
-            except (TypeError, ValueError):
-                pass
+    # AmneziaWG-поля (jc/jmin/jmax/s0-s4/h1-h4/i1-i5) парсер сохраняет в server-dict для
+    # будущей поддержки, но в JSON НЕ эмитим: upstream sing-box их не знает (unknown field
+    # → конфиг отклоняется). AWG-runtime в Kitsune отложен на v0.5+ через отдельный
+    # amneziawg-go-демон. Сейчас при попытке подключения к AWG-серверу sing-box стартует
+    # как обычный WG — без обфускации (DPI вероятно дропнет, но handshake может пройти
+    # если сервер также слушает классический WG-режим).
     return ep
 
 
@@ -658,17 +642,14 @@ def check_config(cfg: dict) -> tuple[bool, str]:
 
 # ---- автообновление ядра (sing-box.exe) ----
 def core_version(exe: str = "sing-box.exe") -> str | None:
-    """Версия бинаря ядра, напр. 'v1.13.11'. None если бинарь отсутствует/не отвечает."""
+    """Версия бинаря ядра, напр. 'v1.13.12'. None если бинарь отсутствует/не отвечает."""
     p = _CORE_DIR / exe
     if not p.exists():
         return None
     try:
-        args = ([str(p), "sing-box", "version"] if exe.lower().startswith("nekobox")
-                else [str(p), "version"])
-        r = subprocess.run(args, capture_output=True, text=True, timeout=5,
-                           **_hidden_kwargs())
-        # официальный sing-box: "sing-box version 1.13.12"
-        # nekobox_core:        "sing-box version v1.13.11"
+        r = subprocess.run([str(p), "version"], capture_output=True, text=True,
+                           timeout=5, **_hidden_kwargs())
+        # официальный sing-box stdout: "sing-box version 1.13.12"
         m = re.search(r"sing-box version\s+v?(\d+\.\d+\.\d+[\w\.\-]*)", r.stdout or "")
         return ("v" + m.group(1)) if m else None
     except Exception:

@@ -326,6 +326,7 @@ class Backend(QObject):
             "stsdone":           "Замер скорости завершён",
             "filereadfail":      "Не удалось прочитать файл",
             "wgbadformat":       "Файл .conf — не валидный WireGuard",
+            "awg_not_supported": "AmneziaWG-обфускация в этой версии Kitsune не активна. Сервер добавлен как обычный WireGuard — DPI его увидит. Для полноценного AWG используйте Amnezia VPN.",
             "appavail":          "Доступна новая версия Kitsune · {tag}",
             "appuptodate":       "Установлена актуальная версия Kitsune · {ver}",
             "apploading":        "Загрузка обновления Kitsune…",
@@ -395,6 +396,7 @@ class Backend(QObject):
             "stsdone":           "Speed test complete",
             "filereadfail":      "Failed to read file",
             "wgbadformat":       "File is not a valid WireGuard .conf",
+            "awg_not_supported": "AmneziaWG obfuscation is not active in this Kitsune version. Server added as plain WireGuard — DPI will see it. For full AWG support use Amnezia VPN.",
             "appavail":          "New Kitsune version available · {tag}",
             "appuptodate":       "Kitsune is up to date · {ver}",
             "apploading":        "Downloading Kitsune update…",
@@ -2249,6 +2251,14 @@ class Backend(QObject):
             if not wg:
                 self.notify.emit(self._tr("wgbadformat"), "error")
                 return 0
+            # AmneziaWG-обфускация в .conf (Jc/Jmin/H1/I1/...) — поля парсятся, но runtime
+            # в текущей версии Kitsune не применяется (sing-box upstream не умеет AWG).
+            # Импортируем сервер как обычный WG + предупреждаем, чтобы юзер знал что
+            # обфускация отключена и DPI его увидит.
+            awg_keys = {"jc", "jmin", "jmax", "s0", "s1", "s2", "s3", "s4",
+                        "h1", "h2", "h3", "h4", "i1", "i2", "i3", "i4", "i5"}
+            if any(k in wg for k in awg_keys):
+                self.notify.emit(self._tr("awg_not_supported"), "info")
             srv = self._make_server(wg)
             ok, _err = self._validate_server(srv)
             srv["_valid"] = ok
