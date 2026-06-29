@@ -448,6 +448,30 @@ def parse_wireguard_conf(text: str) -> dict | None:
             out["mtu"] = int(mtu)
         except ValueError:
             pass
+
+    # AmneziaWG 2.0 obfuscation поля в [Interface]: Jc/Jmin/Jmax (junk packets),
+    # S0-S4 (random prefix sizes), H1-H4 (dynamic headers), I1-I5 (signature/CPS packets).
+    # nekobox_core.exe собран с with_awg → понимает их прямо на wireguard endpoint.
+    def _ci(d, *keys):
+        for k in keys:
+            v = d.get(k)
+            if v is not None:
+                return str(v).strip()
+        return ""
+
+    for fld in ("Jc", "Jmin", "Jmax", "S0", "S1", "S2", "S3", "S4",
+                "H1", "H2", "H3", "H4"):
+        v = _ci(iface, fld, fld.lower(), fld.upper())
+        if v:
+            try:
+                out[fld.lower()] = int(v)
+            except ValueError:
+                pass
+    for fld in ("I1", "I2", "I3", "I4", "I5"):
+        v = _ci(iface, fld, fld.lower(), fld.upper())
+        if v:
+            out[fld.lower()] = v   # хранится как-есть, CPS-DSL передаём в sing-box без обработки
+
     if not (out["wgKey"] and out["peerKey"]):
         return None
     return out
@@ -462,8 +486,13 @@ def _wireguard_endpoint(s: dict) -> dict:
         mtu = 1420
     local = s.get("localAddr") or "172.16.0.2/32"
     allowed = s.get("allowedIps") or "0.0.0.0/0"
-    addrs = [a.strip() for a in (local.split(",") if isinstance(local, str) else local) if a.strip()]
+    addrs_raw = [a.strip() for a in (local.split(",") if isinstance(local, str) else local) if a.strip()]
     allowed_list = [a.strip() for a in (allowed.split(",") if isinstance(allowed, str) else allowed) if a.strip()]
+    # WG .conf разрешает Address без CIDR (просто IP), sing-box endpoint требует prefix.
+    # IPv6 detect по ':' — для IPv4 добавляем /32, для IPv6 /128.
+    def _ensure_cidr(a: str) -> str:
+        return a if "/" in a else (a + ("/128" if ":" in a else "/32"))
+    addrs = [_ensure_cidr(a) for a in addrs_raw]
     peer = {
         "address": s.get("address", ""),
         "port": int(s.get("port") or 51820),
@@ -472,7 +501,7 @@ def _wireguard_endpoint(s: dict) -> dict:
     }
     if s.get("psk"):
         peer["pre_shared_key"] = s["psk"]
-    return {
+    ep = {
         "type": "wireguard",
         "tag": "proxy",
         "address": addrs,
@@ -480,6 +509,28 @@ def _wireguard_endpoint(s: dict) -> dict:
         "mtu": mtu,
         "peers": [peer],
     }
+    # AmneziaWG 1.5: nekobox_core.exe (with_awg, sing-box v1.13.11) поддерживает базовые
+    # поля обфускации с full-name ключами. AWG 2.0 поля (S0/S3/S4 и CPS-пакеты I1-I5)
+    # nekobox пока не реализует — мы их храним в server-dict для совместимости с .conf,
+    # но в JSON не эмитим (иначе sing-box "unknown field" → конфиг отклоняется).
+    _AWG_KEY_MAP = {
+        "jc":   "junk_packet_count",
+        "jmin": "junk_packet_min_size",
+        "jmax": "junk_packet_max_size",
+        "s1":   "init_packet_junk_size",
+        "s2":   "response_packet_junk_size",
+        "h1":   "init_packet_magic_header",
+        "h2":   "response_packet_magic_header",
+        "h3":   "underload_packet_magic_header",
+        "h4":   "transport_packet_magic_header",
+    }
+    for short, long in _AWG_KEY_MAP.items():
+        if short in s and s[short] is not None:
+            try:
+                ep[long] = int(s[short])
+            except (TypeError, ValueError):
+                pass
+    return ep
 
 
 def server_tag(idx: int) -> str:

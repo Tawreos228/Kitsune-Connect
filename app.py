@@ -1825,7 +1825,12 @@ class Backend(QObject):
                      # Hysteria 2-only:
                      "obfsType", "obfsPassword", "upMbps", "downMbps", "ports", "pinSHA256",
                      # Shadowsocks plugin (из clash-yaml подписок):
-                     "ssPlugin", "ssPluginOpts"]
+                     "ssPlugin", "ssPluginOpts",
+                     # AmneziaWG 2.0 (для WG-серверов с DPI-обфускацией):
+                     "jc", "jmin", "jmax",
+                     "s0", "s1", "s2", "s3", "s4",
+                     "h1", "h2", "h3", "h4",
+                     "i1", "i2", "i3", "i4", "i5"]
 
     def _make_server(self, data: dict, keep_ping=None) -> dict:
         name = (data.get("name") or "").strip() or (data.get("address") or "Сервер")
